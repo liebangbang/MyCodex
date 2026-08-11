@@ -1,4 +1,4 @@
-// MyCode 前端逻辑：三栏布局 + 流式对话 + 产物预览
+// MyCodex 前端逻辑：三栏布局 + 流式对话 + 产物预览
 (function () {
   "use strict";
 
@@ -15,7 +15,7 @@
   const artCountEl = $("artCount");
 
   // ---------------- 主题（亮/暗，跟随系统 + 手动切换 + 记忆） ----------------
-  const themeKey = "mycode_theme"; // "light" | "dark" | "auto"
+  const themeKey = "mycodex_theme"; // "light" | "dark" | "auto"
   const media = window.matchMedia("(prefers-color-scheme: dark)");
 
   // 主题图标（线性 SVG，避免 emoji 渲染差异）
@@ -180,7 +180,7 @@
     m.className = "msg assistant";
     const label = document.createElement("div");
     label.className = "msg-label";
-    label.textContent = "mycode";
+    label.textContent = "MyCodex";
     const b = document.createElement("div");
     b.className = "bubble";
     m.appendChild(label);

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""生成 MyCode 科技感 macOS 应用图标 (.icns)——更亮、霓虹紫/青渐变 + 光晕 + 点阵。"""
+"""生成 MyCodex 科技感 macOS 应用图标 (.icns)——更亮、霓虹紫/青渐变 + 光晕 + 点阵。"""
 import os
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 SIZE = 1024
 FONT_PATH = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
-OUT_DIR = "/tmp/mycode_iconbuild"
+OUT_DIR = "/tmp/mycodex_iconbuild"
 ICONSET = os.path.join(OUT_DIR, "AppIcon.iconset")
 os.makedirs(ICONSET, exist_ok=True)
 

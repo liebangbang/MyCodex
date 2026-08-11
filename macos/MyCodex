@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MyCode 启动器（开源版，跨机器可用）
+MyCodex 启动器（开源版，跨机器可用）
 - 本体逻辑在 app/backend.py（打包后位于 Contents/Resources/app/backend.py）
 - 依赖：Python 3.10+ 与 pywebview（macOS: pip install "pywebview[mac]"）
 用法：
-  仓库内运行：  python3 macos/MyCode
+  仓库内运行：  python3 macos/MyCodex
   打包为 .app： 见 README 的「构建 .app」一节
 """
 import os
@@ -14,8 +14,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 兼容两种布局：
-#   A) 仓库布局：macos/MyCode 与 app/backend.py 同级
-#   B) 打包 .app：Contents/MacOS/MyCode 与 Contents/Resources/app/backend.py
+#   A) 仓库布局：macos/MyCodex 与 app/backend.py 同级
+#   B) 打包 .app：Contents/MacOS/MyCodex 与 Contents/Resources/app/backend.py
 CANDIDATES = [
     os.path.join(HERE, "..", "Resources", "app"),   # .app 内
     os.path.join(os.path.dirname(HERE), "app"),     # 仓库内

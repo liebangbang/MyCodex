@@ -1,4 +1,4 @@
-# MyCode
+# MyCodex
 
 一个基于 [DeepSeek API](https://api.deepseek.com) 的**本地编码代理桌面应用**（macOS）。三栏界面：左侧任务列表、中间对话框、右侧产物预览。支持文件读写、命令执行、会话存档续聊与思考模式。
 
@@ -27,7 +27,7 @@
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python3 macos/MyCode
+python3 macos/MyCodex
 ```
 
 ## 配置
@@ -52,11 +52,11 @@ export DEEPSEEK_API_KEY="你的 DeepSeek API Key"
 
 ## 构建 .app（macOS 原生应用）
 
-参考 `macos/` 目录：`Info.plist` 与启动器 `MyCode`。图标由 `build_icon.py`（依赖 Pillow）生成：
+参考 `macos/` 目录：`Info.plist` 与启动器 `MyCodex`。图标由 `build_icon.py`（依赖 Pillow）生成：
 
 ```bash
-python3 build_icon.py                 # 生成 /tmp/mycode_iconbuild/AppIcon.iconset
-iconutil -c icns -o macos/AppIcon.icns /tmp/mycode_iconbuild/AppIcon.iconset
+python3 build_icon.py                 # 生成 /tmp/mycodex_iconbuild/AppIcon.iconset
+iconutil -c icns -o macos/AppIcon.icns /tmp/mycodex_iconbuild/AppIcon.iconset
 ```
 
 打包时把 `app/`、`macos/Info.plist`、`macos/AppIcon.icns` 按标准 `.app` 结构放置，启动器 shebang 指向你的 Python（含 pywebview 的 venv）。

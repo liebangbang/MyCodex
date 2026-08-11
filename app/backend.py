@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-MyCode 后端（pywebview 版）——接入 DeepSeek API，承接编码代理逻辑。
+MyCodex 后端（pywebview 版）——接入 DeepSeek API，承接编码代理逻辑。
 
 本文件只负责「大脑」：流式对话、工具执行、会话存档、思考档判定。
 所有界面交互通过 call_js() 把数据推给前端 HTML/JS。
@@ -42,7 +42,7 @@ def log(msg):
 # --------------------------------------------------------------------------
 # 配置与常量
 # --------------------------------------------------------------------------
-APP_NAME = "MyCode"
+APP_NAME = "MyCodex"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
 CONFIG_DIR = Path.home() / ".config" / "mycode"
@@ -478,7 +478,7 @@ def _handle_chunk(chunk, content, reasoning, tc_acc, on_text, on_reason):
 
 def build_system_prompt(cwd):
     return (
-        "你是 MyCode，一个 macOS 应用里的编码代理，底层由 DeepSeek 模型驱动。\n\n"
+        "你是 MyCodex，一个 macOS 应用里的编码代理，底层由 DeepSeek 模型驱动。\n\n"
         f"工作目录：{cwd}\n"
         "你可以用以下工具来实际完成编码任务：\n"
         "  - read_file / write_file / edit_file：读写和修改文件\n"

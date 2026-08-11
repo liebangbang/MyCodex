@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>MyCode</string>
+    <string>MyCodex</string>
     <key>CFBundleDisplayName</key>
-    <string>MyCode</string>
+    <string>MyCodex</string>
     <key>CFBundleIdentifier</key>
-    <string>com.mycode.app</string>
+    <string>com.mycodex.app</string>
     <key>CFBundleVersion</key>
     <string>1.0</string>
     <key>CFBundleShortVersionString</key>
@@ -15,7 +15,7 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
-    <string>MyCode</string>
+    <string>MyCodex</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
