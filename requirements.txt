@@ -1,0 +1,1 @@
+pywebview[mac]>=6.0

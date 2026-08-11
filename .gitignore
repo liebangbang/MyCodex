@@ -1,0 +1,23 @@
+# ---------- Python ----------
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------- 本地敏感数据（MyCode 运行时生成于 ~/.config/mycode，切勿入仓） ----------
+config.json
+sessions/
+startup.log
+.config/
+
+# ---------- 构建产物 ----------
+build/
+dist/
+*.icns.tmp
+
+# ---------- 系统 ----------
+.DS_Store
+.AppleDouble
