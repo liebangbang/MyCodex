@@ -61,8 +61,10 @@ RISKY_PATTERNS = [
 
 CMD_OUTPUT_LIMIT = 40000
 READ_LINE_LIMIT = 2000
-MAX_TURNS = 25
+MAX_TURNS = 60
 MAX_TOKENS = 8192
+VISION_MAX_TOKENS = 4096   # 千问 VL 单次回复上限（比 DeepSeek 保守）
+VISION_MAX_PDF_PAGES = 5   # PDF 最多转 5 页发给视觉模型
 
 COMPLEX_KEYWORDS = [
     "设计", "重构", "架构", "优化", "调试", "排错", "分析", "为什么", "原理", "比较",
@@ -208,6 +210,9 @@ def load_config():
         "api_key": os.environ.get("DEEPSEEK_API_KEY"),
         "model": DEFAULT_MODEL,
         "base_url": DEFAULT_BASE_URL,
+        "vision_api_key": os.environ.get("DASHSCOPE_API_KEY"),
+        "vision_model": os.environ.get("QWEN_VL_MODEL") or "qwen-vl-max",
+        "vision_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     }
     if CONFIG_FILE.exists():
         try:
@@ -215,9 +220,21 @@ def load_config():
             for k in ("api_key", "model", "base_url"):
                 if data.get(k):
                     cfg[k] = data[k]
+            for k in ("vision_api_key", "vision_model", "vision_base_url"):
+                if data.get(k):
+                    cfg[k] = data[k]
         except Exception as e:
             log("读取配置文件失败：" + str(e))
     return cfg
+
+
+def _vision_cfg(cfg):
+    """返回千问多模态调用所需的配置；key 未单独配置时回退用主 key。"""
+    return {
+        "api_key": cfg.get("vision_api_key") or cfg.get("api_key"),
+        "model": cfg.get("vision_model") or "qwen-vl-max",
+        "base_url": cfg.get("vision_base_url") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    }
 
 
 # --------------------------------------------------------------------------
@@ -495,6 +512,149 @@ def build_system_prompt(cwd):
     )
 
 
+def build_vision_system_prompt():
+    return (
+        "你是 MyCodex 的视觉助手，由通义千问 Qwen-VL 驱动，能够看懂图片和文档。\n"
+        "请仔细观察用户提供的图片 / 文档内容，结合用户的问题，用简体中文清晰、准确地回答。\n"
+        "如果图片是截图或代码，请完整转录或提取关键信息；如果看不清楚，如实说明，不要编造。\n"
+    )
+
+
+# --------------------------------------------------------------------------
+# 千问多模态（Qwen-VL）：图片 / PDF 文档理解
+# --------------------------------------------------------------------------
+def _pdf_to_image_dataurls(data_bytes, max_pages=VISION_MAX_PDF_PAGES):
+    """用 macOS Quartz 把 PDF 字节渲染成 PNG，返回 data URL 列表（最多 max_pages 页）。"""
+    try:
+        import base64
+        import tempfile
+        import Foundation
+        import Quartz
+    except Exception as e:
+        raise RuntimeError(f"PDF 渲染依赖不可用：{e}")
+
+    data = Foundation.NSData.dataWithBytes_length_(data_bytes, len(data_bytes))
+    if not data or len(data) == 0:
+        raise RuntimeError("PDF 数据为空")
+    provider = Quartz.CGDataProviderCreateWithCFData(data)
+    pdf = Quartz.CGPDFDocumentCreateWithProvider(provider)
+    if not pdf:
+        raise RuntimeError("无法解析 PDF 文件")
+    total = Quartz.CGPDFDocumentGetNumberOfPages(pdf)
+    if total == 0:
+        raise RuntimeError("PDF 没有页面")
+    pages = min(total, max_pages)
+    out = []
+    for i in range(1, pages + 1):
+        page = Quartz.CGPDFDocumentGetPage(pdf, i)
+        rect = Quartz.CGPDFPageGetBoxRect(page, Quartz.kCGPDFMediaBox)
+        scale = 2.0
+        w = max(1, int(rect.size.width * scale))
+        h = max(1, int(rect.size.height * scale))
+        cs = Quartz.CGColorSpaceCreateDeviceRGB()
+        ctx = Quartz.CGBitmapContextCreate(None, w, h, 8, 0, cs, Quartz.kCGImageAlphaPremultipliedLast)
+        if not ctx:
+            raise RuntimeError("创建位图上下文失败")
+        Quartz.CGContextSetRGBFillColor(ctx, 1, 1, 1, 1)
+        Quartz.CGContextFillRect(ctx, Quartz.CGRectMake(0, 0, w, h))
+        Quartz.CGContextScaleCTM(ctx, scale, scale)
+        Quartz.CGContextDrawPDFPage(ctx, page)
+        img = Quartz.CGBitmapContextCreateImage(ctx)
+        if not img:
+            continue
+        fd, tmp = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            url = Foundation.NSURL.fileURLWithPath_(tmp)
+            dest = Quartz.CGImageDestinationCreateWithURL(url, "public.png", 1, None)
+            if not dest:
+                continue
+            Quartz.CGImageDestinationAddImage(dest, img, None)
+            if Quartz.CGImageDestinationFinalize(dest):
+                b64 = base64.b64encode(Path(tmp).read_bytes()).decode("ascii")
+                out.append("data:image/png;base64," + b64)
+        finally:
+            try:
+                Path(tmp).unlink(missing_ok=True)
+            except Exception:
+                pass
+    if not out:
+        raise RuntimeError("PDF 渲染失败，未生成任何页面图片")
+    return out
+
+
+def _build_vision_content(text, image):
+    """构造千问 VL 的 content 数组：文本 + 图片/PDF。"""
+    parts = []
+    if text and text.strip():
+        parts.append({"type": "text", "text": text.strip()})
+    if image:
+        if image.startswith("data:application/pdf"):
+            import base64
+            _, _, b64 = image.partition(",")
+            try:
+                pages = _pdf_to_image_dataurls(base64.b64decode(b64))
+            except Exception as e:
+                raise RuntimeError(f"PDF 转图片失败：{e}")
+            for p in pages:
+                parts.append({"type": "image_url", "image_url": {"url": p}})
+        elif image.startswith("data:image/"):
+            parts.append({"type": "image_url", "image_url": {"url": image}})
+        else:
+            raise RuntimeError("不支持的附件格式")
+    if not parts:
+        raise RuntimeError("没有可发送的内容")
+    return parts
+
+
+def stream_vision(messages, cfg, max_tokens=VISION_MAX_TOKENS, on_text=None):
+    """调用千问 VL（OpenAI 兼容接口，流式，无工具）。返回完整回复文本。"""
+    v = _vision_cfg(cfg)
+    if not v["api_key"]:
+        raise RuntimeError("未配置千问视觉模型 Key（config.json 的 vision_api_key 或环境变量 DASHSCOPE_API_KEY）")
+    body = {
+        "model": v["model"],
+        "messages": messages,
+        "stream": True,
+        "max_tokens": max_tokens,
+    }
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = Request(
+        v["base_url"].rstrip("/") + "/chat/completions",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {v['api_key']}",
+            "Accept": "text/event-stream",
+        },
+        method="POST",
+    )
+    content = []
+    reasoning = []
+    tc_acc = {}
+    with urlopen(req, timeout=600) as resp:
+        buf = ""
+        for raw in resp:
+            if not raw:
+                continue
+            buf += raw.decode("utf-8", errors="replace")
+            while "\n\n" in buf:
+                event, buf = buf.split("\n\n", 1)
+                for line in event.splitlines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(payload)
+                    except Exception:
+                        continue
+                    _handle_chunk(chunk, content, reasoning, tc_acc, on_text, None)
+    return "".join(content)
+
+
 # --------------------------------------------------------------------------
 # 会话管理
 # --------------------------------------------------------------------------
@@ -514,6 +674,14 @@ def _fmt_size(n):
     if n < 1024 * 1024:
         return f"{n / 1024:.1f}KB"
     return f"{n / 1024 / 1024:.1f}MB"
+
+
+def _safe_name(name):
+    """把任务名转换成可安全用作文件名的形式。"""
+    name = (name or "").strip()
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:80] or "任务"
 
 
 # --------------------------------------------------------------------------
@@ -541,6 +709,9 @@ class Api:
         self.transcript = []      # 界面展示用（user/assistant/tool 等）
         self.artifacts = []       # 本次任务产物
         self.session_name = None
+        self.pinned = False
+        self.parent = None
+        self._pending_image = None
         self._stop = False
         self._asst_open = False
         self._asst_text = ""
@@ -571,6 +742,7 @@ class Api:
             "artifacts": self.artifacts,
             "sessions": self.list_sessions(),
             "need_key": not bool(self.cfg.get("api_key")),
+            "vision_ok": bool(_vision_cfg(self.cfg).get("api_key")),
         }
 
     def init(self):
@@ -588,8 +760,11 @@ class Api:
                     "name": d.get("name", p.stem),
                     "msg_count": len(d.get("transcript", [])),
                     "updated": d.get("updated", p.stat().st_mtime),
+                    "pinned": bool(d.get("pinned")),
+                    "parent": d.get("parent") or None,
                 })
-        out.sort(key=lambda x: x["updated"], reverse=True)
+        # 置顶任务在前，其余按更新时间倒序
+        out.sort(key=lambda x: (not x["pinned"], -x["updated"]))
         return out
 
     # -------- 任务管理 --------
@@ -601,12 +776,14 @@ class Api:
             i += 1
         return name
 
-    def new_task(self, name=None):
-        base = (name or "任务").strip() or "任务"
+    def new_task(self, name=None, parent=None):
+        base = _safe_name(name) or "任务"
         self.session_name = self._unique_name(base)
         self.history = []
         self.transcript = []
         self.artifacts = []
+        self.pinned = False
+        self.parent = _safe_name(parent) if parent else None
         self._save()
         return self._state()
 
@@ -624,6 +801,8 @@ class Api:
         self.artifacts = data.get("artifacts", [])
         self.model = data.get("model", self.model)
         self.think_mode = data.get("think_mode", self.think_mode)
+        self.pinned = bool(data.get("pinned"))
+        self.parent = data.get("parent") or None
         cwd = data.get("cwd")
         if cwd and Path(cwd).exists():
             self.cwd = Path(cwd)
@@ -637,6 +816,129 @@ class Api:
             "name": name,
         }
 
+    def rename_task(self, old_name, new_name):
+        """重命名任务：改文件名 + 同步更新 JSON 内 name 与子任务 parent。"""
+        old = _safe_name(old_name)
+        new = _safe_name(new_name)
+        if not new:
+            return {"error": "任务名不能为空"}
+        if new == old:
+            return {"ok": True, "name": old}
+        old_p = SESSIONS_DIR / f"{old}.json"
+        new_p = SESSIONS_DIR / f"{new}.json"
+        if not old_p.exists():
+            return {"error": "任务不存在"}
+        if new_p.exists():
+            return {"error": f"已存在同名任务：{new}"}
+        try:
+            data = json.loads(old_p.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"error": str(e)}
+        data["name"] = new
+        old_p.rename(new_p)
+        # 同步更新子任务的 parent 字段
+        for cp in SESSIONS_DIR.glob("*.json"):
+            try:
+                cd = json.loads(cp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if cd.get("parent") == old:
+                cd["parent"] = new
+                tmp = cp.with_suffix(".tmp")
+                tmp.write_text(json.dumps(cd, ensure_ascii=False, indent=1), encoding="utf-8")
+                tmp.replace(cp)
+        # 写回改名后的父任务
+        tmp = new_p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(new_p)
+        # 若当前打开的就是被改名的任务，同步内存状态
+        if self.session_name == old:
+            self.session_name = new
+        return {"ok": True, "name": new}
+
+    def toggle_pin(self, name):
+        """切换任务置顶状态。"""
+        name = _safe_name(name)
+        p = SESSIONS_DIR / f"{name}.json"
+        if not p.exists():
+            return {"error": "任务不存在"}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"error": str(e)}
+        data["pinned"] = not bool(data.get("pinned"))
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(p)
+        if self.session_name == name:
+            self.pinned = data["pinned"]
+        return {"ok": True, "pinned": data["pinned"]}
+
+    def new_subtask(self, parent, name=None):
+        """在父任务下新建子任务（空会话，不切换当前上下文）。"""
+        parent = _safe_name(parent)
+        if not (SESSIONS_DIR / f"{parent}.json").exists():
+            return {"error": "父任务不存在"}
+        child = self._unique_name(_safe_name(name) or "子任务")
+        data = {
+            "name": child,
+            "model": self.model,
+            "think_mode": self.think_mode,
+            "cwd": str(self.cwd),
+            "updated": time.time(),
+            "pinned": False,
+            "parent": parent,
+            "history": [],
+            "transcript": [],
+            "artifacts": [],
+        }
+        p = SESSIONS_DIR / f"{child}.json"
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(p)
+        return {"ok": True, "name": child, "parent": parent}
+
+    def delete_task(self, name):
+        """删除任务。若存在子任务则级联一并删除，返回被删除的名单。"""
+        name = _safe_name(name)
+        p = SESSIONS_DIR / f"{name}.json"
+        if not p.exists():
+            return {"error": "任务不存在"}
+
+        # 递归收集该任务及其所有子孙任务
+        to_delete = []
+
+        def _collect(n):
+            to_delete.append(n)
+            for cp in SESSIONS_DIR.glob("*.json"):
+                try:
+                    cd = json.loads(cp.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if cd.get("parent") == n:
+                    _collect(cd.get("name", cp.stem))
+
+        _collect(name)
+
+        deleted = []
+        for n in to_delete:
+            fp = SESSIONS_DIR / f"{n}.json"
+            try:
+                fp.unlink()
+                deleted.append(n)
+            except Exception:
+                pass
+
+        # 若删除的是当前打开的任务，重置内存状态
+        if self.session_name in to_delete:
+            self.session_name = None
+            self.history = []
+            self.transcript = []
+            self.artifacts = []
+            self.pinned = False
+            self.parent = None
+        return {"ok": True, "deleted": deleted}
+
     def _save(self):
         if not self.session_name:
             return
@@ -646,6 +948,8 @@ class Api:
             "think_mode": self.think_mode,
             "cwd": str(self.cwd),
             "updated": time.time(),
+            "pinned": self.pinned,
+            "parent": self.parent,
             "history": self.history,
             "transcript": self.transcript,
             "artifacts": self.artifacts,
@@ -854,13 +1158,20 @@ class Api:
         return str(result)
 
     # -------- 主循环 --------
-    def send(self, text):
-        if not text or not text.strip():
+    def send(self, text, image=None):
+        text = (text or "").strip()
+        if not text and not image:
             return "empty"
-        text = text.strip()
         if not self.cfg.get("api_key"):
             self.call_js("appendSystem", "未配置 API Key，请在 ~/.config/mycode/config.json 设置。")
             return "no_key"
+        if image:
+            if not _vision_cfg(self.cfg).get("api_key"):
+                self.call_js("appendSystem",
+                             "未配置千问视觉模型 Key：请在 ~/.config/mycode/config.json 增加 "
+                             "vision_api_key（或设置环境变量 DASHSCOPE_API_KEY），即可让 AI 看懂图片/文档。")
+                return "no_vision_key"
+            self._pending_image = image
         if not self.session_name:
             self.new_task()
         # 独立线程跑 agent loop，避免阻塞 pywebview 的 API 线程池
@@ -873,13 +1184,39 @@ class Api:
         self._asst_open = False
         self.call_js("setBusy", True)
         self.call_js("appendUser", text)
-        self.transcript.append({"role": "user", "text": text})
+        self.transcript.append({"role": "user", "text": text, "image": bool(self._pending_image)})
         try:
-            self._agent_loop(text)
+            if self._pending_image:
+                self._vision_loop(text)
+            else:
+                self._agent_loop(text)
         finally:
+            self._pending_image = None
             self.call_js("setBusy", False)
             self._save()
             self.call_js("afterSend")
+
+    def _vision_loop(self, user_input):
+        """多模态单轮：把图片/PDF 与历史文字上下文一起发给千问 VL。"""
+        image = self._pending_image
+        try:
+            content = _build_vision_content(user_input, image)
+        except Exception as e:
+            self.call_js("appendSystem", f"附件处理失败：{e}")
+            return
+        messages = [{"role": "system", "content": build_vision_system_prompt()}] + list(self.history)
+        messages.append({"role": "user", "content": content})
+        self._ensure_assistant()
+        try:
+            reply = stream_vision(messages, self.cfg, VISION_MAX_TOKENS, on_text=self._on_text)
+        except Exception as e:
+            self.call_js("appendSystem", f"视觉模型调用失败：{e}")
+            return
+        # 存档：图片/文档只在当前轮参与；history 存纯文字，保证后续 DeepSeek 上下文兼容
+        self.history.append({"role": "user", "content": user_input})
+        self.history.append({"role": "assistant", "content": reply})
+        self.transcript.append({"role": "assistant", "text": reply})
+        self.call_js("appendSystem", "完成（已用视觉模型理解图片/文档）")
 
     def _agent_loop(self, user_input):
         self._stop = False
@@ -933,7 +1270,7 @@ class Api:
                     self.call_js("appendSystem", "完成")
                     break
             else:
-                self.call_js("appendSystem", "达到最大轮数")
+                self.call_js("appendSystem", "已达到最大轮数（已保留上下文）；可继续发送「继续」让 MyCodex 接着完成")
         except InterruptedError:
             self.call_js("appendSystem", "已停止")
         except Exception as e:

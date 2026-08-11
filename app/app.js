@@ -168,7 +168,7 @@
     m.className = "msg user";
     const b = document.createElement("div");
     b.className = "bubble";
-    b.textContent = text;
+    b.textContent = text || "🖼️ 发送了图片/文档";
     m.appendChild(b);
     messagesEl.appendChild(m);
     scrollDown();
@@ -298,17 +298,133 @@
   // ---------------- 任务列表 ----------------
   function renderSessions(sessions) {
     taskListEl.innerHTML = "";
+    // 按 parent 分组：先渲染根任务，再渲染其子任务（缩进）
+    const byParent = {};
     sessions.forEach((s) => {
-      const item = document.createElement("div");
-      item.className = "task-item" + (s.name === activeTask ? " active" : "");
-      item.dataset.name = s.name;
-      const date = new Date((s.updated || 0) * 1000);
-      const rel = isNaN(date) ? "" : date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
-      item.innerHTML =
-        '<div class="task-name">' + esc(s.name) + "</div>" +
-        '<div class="task-meta">' + (s.msg_count || 0) + " 条 · " + esc(rel) + "</div>";
-      item.onclick = () => openTask(s.name);
-      taskListEl.appendChild(item);
+      const key = s.parent || "";
+      (byParent[key] = byParent[key] || []).push(s);
+    });
+    const roots = byParent[""] || [];
+    const rendered = new Set();
+    roots.forEach((root) => {
+      taskListEl.appendChild(makeTaskItem(root, 0));
+      rendered.add(root.name);
+      (byParent[root.name] || []).forEach((child) => {
+        taskListEl.appendChild(makeTaskItem(child, 1));
+        rendered.add(child.name);
+      });
+    });
+    // 兜底：父任务已不存在（孤儿子任务）也作为根展示，避免丢失
+    sessions.forEach((s) => {
+      if (!rendered.has(s.name)) taskListEl.appendChild(makeTaskItem(s, 0));
+    });
+    highlightActive();
+  }
+
+  function makeTaskItem(s, depth) {
+    const item = document.createElement("div");
+    item.className = "task-item" + (s.name === activeTask ? " active" : "") + (s.pinned ? " pinned" : "");
+    item.dataset.name = s.name;
+    item.dataset.depth = depth;
+    const date = new Date((s.updated || 0) * 1000);
+    const rel = isNaN(date) ? "" : date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    const indent = depth > 0 ? ' style="padding-left:' + (26 + depth * 16) + 'px"' : "";
+    item.innerHTML =
+      '<div class="task-row">' +
+        '<div class="task-main"' + indent + ">" +
+          '<div class="task-text">' +
+            '<div class="task-name">' + (depth > 0 ? "↳ " : "") + esc(s.name) + "</div>" +
+            '<div class="task-meta">' +
+              (depth > 0 ? "子任务 · " : "") +
+              (s.msg_count || 0) + " 条 · " + esc(rel) +
+            "</div>" +
+          "</div>" +
+        "</div>" +
+        '<div class="task-actions">' +
+          '<button class="task-btn" title="重命名" data-act="rename">' +
+            '<svg class="icon" viewBox="0 0 24 24"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>' +
+          "</button>" +
+          '<button class="task-btn' + (s.pinned ? " pinned" : "") + '" title="' + (s.pinned ? "取消置顶" : "置顶") + '" data-act="pin">' +
+            '<svg class="icon" viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 4h6l-1 7 3 3H7l3-3z"/></svg>' +
+          "</button>" +
+          '<button class="task-btn" title="新建子任务" data-act="sub">' +
+            '<svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>' +
+          "</button>" +
+          '<button class="task-btn danger" title="删除任务" data-act="del">' +
+            '<svg class="icon" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>' +
+          "</button>" +
+        "</div>" +
+      "</div>";
+    item.onclick = () => openTask(s.name);
+    item.querySelectorAll(".task-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const act = btn.dataset.act;
+        if (act === "rename") renameTask(s.name);
+        else if (act === "pin") togglePin(s.name);
+        else if (act === "sub") newSubtask(s.name);
+        else if (act === "del") deleteTask(s.name);
+      });
+    });
+    return item;
+  }
+
+  function renameTask(name) {
+    const newName = window.prompt("重命名任务：", name);
+    if (newName === null) return;
+    const v = newName.trim();
+    if (!v || v === name) return;
+    if (!apiReady()) return;
+    window.pywebview.api.rename_task(name, v).then((res) => {
+      if (res.error) { appendSystem("重命名失败：" + res.error); return; }
+      if (activeTask === name) {
+        activeTask = res.name;
+        setHeader({ session_name: res.name });
+      }
+      refreshSessions();
+      highlightActive();
+    });
+  }
+
+  function togglePin(name) {
+    if (!apiReady()) return;
+    window.pywebview.api.toggle_pin(name).then((res) => {
+      if (res.error) { appendSystem("操作失败：" + res.error); return; }
+      refreshSessions();
+      highlightActive();
+    });
+  }
+
+  function newSubtask(parent) {
+    const name = window.prompt("子任务名称（可留空，自动命名）：", "");
+    if (name === null) return;
+    if (!apiReady()) return;
+    window.pywebview.api.new_subtask(parent, name.trim()).then((res) => {
+      if (res.error) { appendSystem("创建子任务失败：" + res.error); return; }
+      openTask(res.name);
+    });
+  }
+
+  function deleteTask(name) {
+    // 统计直接子任务数量，删除时提示会级联删除
+    const children = (window._sessionsCache || []).filter((s) => s.parent === name).length;
+    const msg = children > 0
+      ? `确认删除任务「${name}」？\n该任务下有 ${children} 个子任务，将一并删除。`
+      : `确认删除任务「${name}」？\n此操作不可撤销。`;
+    if (!window.confirm(msg)) return;
+    if (!apiReady()) return;
+    window.pywebview.api.delete_task(name).then((res) => {
+      if (res.error) { appendSystem("删除失败：" + res.error); return; }
+      // 若删除的是当前打开的任务，清空界面
+      if (activeTask === name) {
+        activeTask = null;
+        clearMessages();
+        setHeader({});
+        renderArtifacts([]);
+        inputEl.focus();
+      }
+      refreshSessions();
+      highlightActive();
     });
   }
 
@@ -327,7 +443,10 @@
   }
 
   function playTranscript(entry) {
-    if (entry.role === "user") appendUser(entry.text);
+    if (entry.role === "user") {
+      appendUser(entry.text || "");
+      if (entry.image) appendSystem("📷 已附带图片/文档，交由视觉模型理解");
+    }
     else if (entry.role === "assistant") { beginAssistant(); appendAssistant(entry.text || ""); finalizeAssistant(); }
     else if (entry.role === "tool") {
       const m = (entry.text || "").match(/^(\w+)\(([\s\S]*?)\)\n([\s\S]*)$/);
@@ -381,6 +500,8 @@
     renderArtifacts(st.artifacts || []);
     if (st.need_key) {
       appendSystem("未配置 API Key，请在 ~/.config/mycode/config.json 设置 api_key。");
+    } else if (st.vision_ok === false) {
+      appendSystem("提示：未配置视觉模型 Key（vision_api_key），发送图片/PDF 前请先在 config.json 设置。");
     }
   }
 
@@ -396,11 +517,13 @@
   // ---------------- 发送 ----------------
   function doSend() {
     const text = inputEl.value.trim();
-    if (!text || busy || !apiReady()) return;
+    const image = pendingImageDataUrl || null;
+    if ((!text && !image) || busy || !apiReady()) return;
     inputEl.value = "";
+    clearImgPreview();
     autoResize();
     setBusy(true);
-    window.pywebview.api.send(text).then(() => {
+    window.pywebview.api.send(text, image).then(() => {
       window.pywebview.api.init().then((st) => { applyState(st); highlightActive(); });
     }).catch((e) => { setBusy(false); appendSystem("发送失败：" + e); });
   }
@@ -414,49 +537,73 @@
     return window.pywebview && window.pywebview.api;
   }
 
-  // ---------------- 图片输入 / OCR ----------------
+  // ---------------- 图片/文档输入（多模态） ----------------
   const fileImgEl = $("fileImg");
   const imgPreviewEl = $("imgPreview");
   const imgThumbEl = $("imgThumb");
   const imgNameEl = $("imgName");
-  let pendingImageDataUrl = null;
+  const imgHintEl = $("imgHint");
+  let pendingImageDataUrl = null;   // data URL（图片 或 PDF）
+  let pendingFileKind = null;       // "image" | "pdf"
+  let ocrRunning = false;
 
-  function showImgPreview(dataUrl, name) {
+  const PDF_ICON = "data:image/svg+xml;base64," + btoa(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#D9484F" stroke-width="1.6"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8M8 16.5h5"/></svg>'
+  );
+
+  function showFilePreview(dataUrl, name, kind) {
     pendingImageDataUrl = dataUrl;
-    imgThumbEl.src = dataUrl;
-    imgNameEl.textContent = name || "图片";
+    pendingFileKind = kind;
+    if (kind === "pdf") {
+      imgThumbEl.src = PDF_ICON;
+      imgNameEl.textContent = name;
+      imgHintEl.textContent = "PDF 将转成图片由 AI 理解（最多前 5 页）";
+    } else {
+      imgThumbEl.src = dataUrl;
+      imgNameEl.textContent = name || "图片";
+      imgHintEl.textContent = "将随消息发送，AI 会理解图片内容";
+    }
     imgPreviewEl.style.display = "flex";
     imgPreviewEl.scrollIntoView({ block: "nearest" });
   }
 
   function clearImgPreview() {
     pendingImageDataUrl = null;
+    pendingFileKind = null;
     imgPreviewEl.style.display = "none";
     imgThumbEl.removeAttribute("src");
     fileImgEl.value = "";
   }
 
   function handleImageFile(file) {
-    if (!file || !/^image\//.test(file.type || "")) {
-      appendSystem("仅支持图片文件（PNG/JPG 等）");
+    if (!file) return;
+    const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name || "");
+    if (isPdf) {
+      const reader = new FileReader();
+      reader.onload = () => showFilePreview(reader.result, file.name, "pdf");
+      reader.onerror = () => appendSystem("读取 PDF 失败");
+      reader.readAsDataURL(file);
+      return;
+    }
+    if (!/^image\//.test(file.type || "")) {
+      appendSystem("仅支持图片（PNG/JPG 等）或 PDF 文档");
       return;
     }
     const reader = new FileReader();
-    reader.onload = () => showImgPreview(reader.result, file.name);
+    reader.onload = () => showFilePreview(reader.result, file.name, "image");
     reader.onerror = () => appendSystem("读取图片失败");
     reader.readAsDataURL(file);
   }
 
-  $("btnImg").onclick = () => fileImgEl.click();
-  fileImgEl.onchange = () => {
-    if (fileImgEl.files && fileImgEl.files[0]) handleImageFile(fileImgEl.files[0]);
-    fileImgEl.value = "";
-  };
-  $("btnImgCancel").onclick = clearImgPreview;
-
-  $("btnOcr").onclick = () => {
+  // OCR：手动把图片文字提取进输入框（本地免费；不影响图片随消息发送）
+  function runOcr() {
     if (!pendingImageDataUrl) return;
     if (!apiReady()) return;
+    if (ocrRunning) return;
+    if (pendingFileKind !== "image") {
+      appendSystem("OCR 仅支持图片；PDF 可直接发送给 AI 理解");
+      return;
+    }
     const btn = $("btnOcr");
     btn.disabled = true;
     const old = btn.textContent;
@@ -473,18 +620,24 @@
         appendSystem("未在图片中识别到文字");
         return;
       }
-      // 把识别结果插入输入框，用户可编辑后发送
       const prefix = inputEl.value.trim() ? "\n\n" : "";
       inputEl.value += prefix + "[图片OCR识别结果]\n" + text;
       autoResize();
-      clearImgPreview();
       inputEl.focus();
     }).catch((e) => {
       btn.disabled = false;
       btn.textContent = old;
       appendSystem("OCR 调用失败：" + e);
     });
+  }
+
+  $("btnImg").onclick = () => fileImgEl.click();
+  fileImgEl.onchange = () => {
+    if (fileImgEl.files && fileImgEl.files[0]) handleImageFile(fileImgEl.files[0]);
+    fileImgEl.value = "";
   };
+  $("btnImgCancel").onclick = clearImgPreview;
+  $("btnOcr").onclick = () => { runOcr(); };
 
   // 粘贴图片
   document.addEventListener("paste", (e) => {

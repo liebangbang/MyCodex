@@ -254,6 +254,12 @@ html, body {
   border-radius: 8px;
   border: 1px solid var(--border);
   background: #fff;
+  flex: 0 0 auto;
+}
+.img-preview img[src^="data:image/svg"] {
+  object-fit: contain;
+  padding: 6px;
+  background: var(--err-bg);
 }
 .img-meta { flex: 1; min-width: 0; }
 .img-name {
@@ -312,7 +318,6 @@ html, body {
 .task-item {
   position: relative;
   border-radius: var(--radius-sm);
-  padding: 9px 11px 9px 13px;
   margin-bottom: 4px;
   cursor: pointer;
   background: transparent;
@@ -331,12 +336,48 @@ html, body {
   width: 3px; border-radius: 3px;
   background: var(--primary);
 }
+.task-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  padding: 9px 8px 9px 13px;
+}
+.task-main { flex: 1; min-width: 0; }
+.task-text { min-width: 0; }
 .task-name {
   font-size: 13px; font-weight: 600; color: var(--text);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .task-item.active .task-name { color: var(--primary-strong); }
 .task-meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.task-item.pinned .task-name::before {
+  content: "📌 ";
+  font-size: 11px;
+}
+.task-actions {
+  display: flex;
+  gap: 2px;
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+.task-item:hover .task-actions,
+.task-item.active .task-actions { opacity: 1; }
+.task-btn {
+  width: 22px; height: 22px;
+  border: none; background: transparent;
+  color: var(--muted);
+  border-radius: 5px;
+  cursor: pointer;
+  padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  transition: all .12s ease;
+}
+.task-btn .icon { width: 13px; height: 13px; }
+.task-btn:hover { color: var(--primary); background: var(--primary-soft); }
+.task-btn.pinned { color: var(--primary); }
+.task-btn.danger:hover { color: var(--err); background: var(--err-bg); }
 
 /* ---------------- 中间对话 ---------------- */
 .center-head {
