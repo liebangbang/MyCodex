@@ -61,7 +61,9 @@ RISKY_PATTERNS = [
 
 CMD_OUTPUT_LIMIT = 40000
 READ_LINE_LIMIT = 2000
-MAX_TURNS = 60
+MAX_REPEAT = 3  # 连续相同工具调用超过此值视为死循环，自动停止
+# 注：对话轮数已设为不限（_agent_loop 用 while True），靠 MAX_REPEAT 防死循环；
+#     如仍需硬性轮数上限，可改回 `for _ in range(N)` 并定义 MAX_TURNS = N。
 MAX_TOKENS = 8192
 VISION_MAX_TOKENS = 4096   # 千问 VL 单次回复上限（比 DeepSeek 保守）
 VISION_MAX_PDF_PAGES = 5   # PDF 最多转 5 页发给视觉模型
@@ -1227,14 +1229,28 @@ class Api:
         ]
         thinking = resolve_think(self.think_mode, user_input)
 
+        last_sig = None
+        repeat = 0
         try:
-            for _ in range(MAX_TURNS):
+            while True:
                 content, reasoning, tool_calls = stream_chat(
                     messages, self.cfg, TOOLS, thinking, MAX_TOKENS,
                     on_text=self._on_text,
                 )
                 assistant_msg = {"role": "assistant", "content": content or None}
                 if tool_calls:
+                    sig = json.dumps(
+                        [(tc["function"]["name"], tc["function"]["arguments"]) for tc in tool_calls],
+                        ensure_ascii=False, sort_keys=True,
+                    )
+                    if sig == last_sig:
+                        repeat += 1
+                    else:
+                        repeat = 0
+                    last_sig = sig
+                    if repeat >= MAX_REPEAT:
+                        self.call_js("appendSystem", "检测到工具调用陷入重复，已自动停止；可继续发送「继续」重试")
+                        break
                     assistant_msg["tool_calls"] = [
                         {
                             "id": tc["id"],
@@ -1269,8 +1285,6 @@ class Api:
                         self.transcript.append({"role": "assistant", "text": content})
                     self.call_js("appendSystem", "完成")
                     break
-            else:
-                self.call_js("appendSystem", "已达到最大轮数（已保留上下文）；可继续发送「继续」让 MyCodex 接着完成")
         except InterruptedError:
             self.call_js("appendSystem", "已停止")
         except Exception as e:
