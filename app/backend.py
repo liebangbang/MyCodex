@@ -212,17 +212,16 @@ def load_config():
         "api_key": os.environ.get("DEEPSEEK_API_KEY"),
         "model": DEFAULT_MODEL,
         "base_url": DEFAULT_BASE_URL,
-        "vision_api_key": os.environ.get("DASHSCOPE_API_KEY"),
-        "vision_model": os.environ.get("QWEN_VL_MODEL") or "qwen-vl-max",
-        "vision_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "vision_provider": os.environ.get("VISION_PROVIDER") or "qwen",
+        "vision_api_key": os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("VISION_API_KEY"),
+        "vision_model": os.environ.get("QWEN_VL_MODEL") or os.environ.get("VISION_MODEL"),
+        "vision_base_url": os.environ.get("VISION_BASE_URL"),
     }
     if CONFIG_FILE.exists():
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            for k in ("api_key", "model", "base_url"):
-                if data.get(k):
-                    cfg[k] = data[k]
-            for k in ("vision_api_key", "vision_model", "vision_base_url"):
+            for k in ("api_key", "model", "base_url", "vision_provider",
+                      "vision_api_key", "vision_model", "vision_base_url"):
                 if data.get(k):
                     cfg[k] = data[k]
         except Exception as e:
@@ -230,12 +229,51 @@ def load_config():
     return cfg
 
 
+# 各视觉厂商默认 endpoint（OpenAI 兼容多模态接口）
+_VISION_DEFAULTS = {
+    "qwen": {
+        "model": "qwen-vl-max",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    },
+    "openai": {
+        "model": "gpt-4o",
+        "base_url": "https://api.openai.com/v1",
+    },
+    "glm": {
+        "model": "glm-4v-plus",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    },
+}
+
+
 def _vision_cfg(cfg):
-    """返回千问多模态调用所需的配置；key 未单独配置时回退用主 key。"""
+    """返回多模态调用所需的配置；支持 provider 自动选择 endpoint。
+    key 未单独配置时回退用主 key（多数视觉厂商与 DeepSeek 不通，仅作兜底）。"""
+    provider = (cfg.get("vision_provider") or "qwen").lower()
+    d = _VISION_DEFAULTS.get(provider, _VISION_DEFAULTS["qwen"])
     return {
+        "provider": provider,
         "api_key": cfg.get("vision_api_key") or cfg.get("api_key"),
-        "model": cfg.get("vision_model") or "qwen-vl-max",
-        "base_url": cfg.get("vision_base_url") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": cfg.get("vision_model") or d["model"],
+        "base_url": cfg.get("vision_base_url") or d["base_url"],
+    }
+
+
+def _chat_cfg(cfg, model=None):
+    """根据模型名自动选 endpoint：DeepSeek（自有）/ Qwen（复用 vision_api_key 走 DashScope 兼容模式）"""
+    model = model or cfg.get("model", DEFAULT_MODEL)
+    if model and model.lower().startswith("qwen"):
+        return {
+            "provider": "qwen",
+            "api_key": cfg.get("vision_api_key") or cfg.get("api_key"),
+            "base_url": cfg.get("vision_base_url") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "model": model,
+        }
+    return {
+        "provider": "deepseek",
+        "api_key": cfg.get("api_key"),
+        "base_url": cfg.get("base_url", DEFAULT_BASE_URL),
+        "model": model,
     }
 
 
@@ -401,8 +439,9 @@ TOOL_IMPL = {
 # DeepSeek 流式调用
 # --------------------------------------------------------------------------
 def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_reason=None):
+    cc = _chat_cfg(cfg, cfg.get("model"))
     body = {
-        "model": cfg["model"],
+        "model": cc["model"],
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",
@@ -410,16 +449,21 @@ def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_rea
         "max_tokens": max_tokens,
     }
     if thinking:
-        body["thinking"] = {"type": "enabled"}
-        body["reasoning_effort"] = "high"
+        if cc["provider"] == "qwen":
+            # DashScope 兼容模式：enable_thinking 顶层布尔
+            body["enable_thinking"] = True
+        else:
+            # DeepSeek：thinking 对象 + reasoning_effort
+            body["thinking"] = {"type": "enabled"}
+            body["reasoning_effort"] = "high"
 
     data = json.dumps(body).encode("utf-8")
     req = Request(
-        cfg["base_url"].rstrip("/") + "/chat/completions",
+        cc["base_url"].rstrip("/") + "/chat/completions",
         data=data,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {cfg['api_key']}",
+            "Authorization": f"Bearer {cc['api_key']}",
             "Accept": "text/event-stream",
         },
         method="POST",
@@ -585,25 +629,28 @@ def _pdf_to_image_dataurls(data_bytes, max_pages=VISION_MAX_PDF_PAGES):
     return out
 
 
-def _build_vision_content(text, image):
-    """构造千问 VL 的 content 数组：文本 + 图片/PDF。"""
+def _build_vision_content(text, images):
+    """构造多模态 content 数组：文本 + 多张图片/PDF（OpenAI 兼容格式）。"""
     parts = []
     if text and text.strip():
         parts.append({"type": "text", "text": text.strip()})
-    if image:
-        if image.startswith("data:application/pdf"):
-            import base64
-            _, _, b64 = image.partition(",")
-            try:
-                pages = _pdf_to_image_dataurls(base64.b64decode(b64))
-            except Exception as e:
-                raise RuntimeError(f"PDF 转图片失败：{e}")
-            for p in pages:
-                parts.append({"type": "image_url", "image_url": {"url": p}})
-        elif image.startswith("data:image/"):
-            parts.append({"type": "image_url", "image_url": {"url": image}})
-        else:
-            raise RuntimeError("不支持的附件格式")
+    if images:
+        for image in images:
+            if not image:
+                continue
+            if image.startswith("data:application/pdf"):
+                import base64
+                _, _, b64 = image.partition(",")
+                try:
+                    pages = _pdf_to_image_dataurls(base64.b64decode(b64))
+                except Exception as e:
+                    raise RuntimeError(f"PDF 转图片失败：{e}")
+                for p in pages:
+                    parts.append({"type": "image_url", "image_url": {"url": p}})
+            elif image.startswith("data:image/"):
+                parts.append({"type": "image_url", "image_url": {"url": image}})
+            else:
+                raise RuntimeError("不支持的附件格式")
     if not parts:
         raise RuntimeError("没有可发送的内容")
     return parts
@@ -713,13 +760,15 @@ class Api:
         self.session_name = None
         self.pinned = False
         self.parent = None
-        self._pending_image = None
+        self._pending_images = []        # 待发送的图片/PDF data URL 列表
+        self._pending_image_kind = None  # "vision" | "ocr"
         self._stop = False
         self._asst_open = False
         self._asst_text = ""
         self._pending_confirm = None
 
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        self._restore_last()
         log("Api init; model=%s; has_key=%s" % (self.model, bool(self.cfg.get("api_key"))))
 
     # -------- 工具：推送到前端 --------
@@ -742,6 +791,7 @@ class Api:
             "cwd_short": _short_cwd(self.cwd),
             "session_name": self.session_name,
             "artifacts": self.artifacts,
+            "transcript": self.transcript if self.session_name else [],
             "sessions": self.list_sessions(),
             "need_key": not bool(self.cfg.get("api_key")),
             "vision_ok": bool(_vision_cfg(self.cfg).get("api_key")),
@@ -787,6 +837,10 @@ class Api:
         self.pinned = False
         self.parent = _safe_name(parent) if parent else None
         self._save()
+        try:
+            (CONFIG_DIR / "last_task.txt").write_text(self.session_name, encoding="utf-8")
+        except Exception:
+            pass
         return self._state()
 
     def open_task(self, name):
@@ -808,6 +862,10 @@ class Api:
         cwd = data.get("cwd")
         if cwd and Path(cwd).exists():
             self.cwd = Path(cwd)
+        try:
+            (CONFIG_DIR / "last_task.txt").write_text(name, encoding="utf-8")
+        except Exception:
+            pass
         return {
             "transcript": self.transcript,
             "artifacts": self.artifacts,
@@ -817,6 +875,17 @@ class Api:
             "cwd_short": _short_cwd(self.cwd),
             "name": name,
         }
+
+    def _restore_last(self):
+        """启动时自动恢复上次打开的任务（不推送前端，由 init 返回的 state 携带历史）。"""
+        try:
+            p = CONFIG_DIR / "last_task.txt"
+            if p.exists():
+                name = p.read_text(encoding="utf-8").strip()
+                if name and (SESSIONS_DIR / f"{name}.json").exists():
+                    self.open_task(name)
+        except Exception:
+            pass
 
     def rename_task(self, old_name, new_name):
         """重命名任务：改文件名 + 同步更新 JSON 内 name 与子任务 parent。"""
@@ -939,6 +1008,10 @@ class Api:
             self.artifacts = []
             self.pinned = False
             self.parent = None
+            try:
+                (CONFIG_DIR / "last_task.txt").unlink(missing_ok=True)
+            except Exception:
+                pass
         return {"ok": True, "deleted": deleted}
 
     def _save(self):
@@ -996,14 +1069,70 @@ class Api:
         return "ok"
 
     def preview(self, path):
+        """按文件类型返回可预览内容：
+        image → base64 图片；html → 网页源码；md → 文本；pdf/二进制 → 提示外部打开；
+        is_url → 文本首行是链接时识别为网页链接；其余文本 → 原样返回。"""
         try:
+            import base64 as _b64
             p = Path(path)
             if not p.exists() or p.is_dir():
                 return {"error": "文件不存在或不是普通文件"}
-            text = p.read_text(encoding="utf-8", errors="replace")
+            name = p.name
+            size = p.stat().st_size
+            ext = p.suffix.lower()
+            base = {"name": name, "size": size, "size_str": _fmt_size(size), "path": str(p)}
+            # 图片：直接返回 data URL 供前端渲染
+            if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg", ".avif"):
+                if size > 10 * 1024 * 1024:
+                    return {**base, "kind": "binary", "hint": "图片过大（>10MB），请用浏览器打开查看"}
+                mime = {
+                    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+                    ".ico": "image/x-icon", ".svg": "image/svg+xml", ".avif": "image/avif",
+                }.get(ext, "image/png")
+                data = _b64.b64encode(p.read_bytes()).decode("ascii")
+                return {**base, "kind": "image", "data_url": f"data:{mime};base64,{data}"}
+            # PDF：浏览器/默认应用打开
+            if ext == ".pdf":
+                return {**base, "kind": "pdf"}
+            # HTML：内嵌网页预览
+            if ext in (".html", ".htm"):
+                text = p.read_text(encoding="utf-8", errors="replace")
+                if len(text) > PREVIEW_LIMIT:
+                    text = text[:PREVIEW_LIMIT] + "\n…（预览已截断）"
+                return {**base, "kind": "html", "content": text}
+            # Markdown：渲染排版
+            if ext in (".md", ".markdown"):
+                text = p.read_text(encoding="utf-8", errors="replace")
+                if len(text) > PREVIEW_LIMIT:
+                    text = text[:PREVIEW_LIMIT] + "\n…（预览已截断）"
+                return {**base, "kind": "md", "content": text}
+            # 二进制
+            raw = p.read_bytes()
+            if b"\x00" in raw[:8192]:
+                return {**base, "kind": "binary", "hint": "二进制文件，无法直接预览"}
+            text = raw.decode("utf-8", errors="replace")
+            is_url = False
+            url = ""
+            first = text.strip().splitlines()[0].strip() if text.strip() else ""
+            if first.startswith(("http://", "https://")):
+                is_url = True
+                url = first
             if len(text) > PREVIEW_LIMIT:
                 text = text[:PREVIEW_LIMIT] + "\n…（预览已截断）"
-            return {"name": p.name, "content": text, "size": p.stat().st_size}
+            return {**base, "kind": "text", "content": text, "is_url": is_url, "url": url}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def open_external(self, path):
+        """用系统默认程序打开本地文件（HTML/PDF/图片会走默认浏览器/预览）。"""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return {"error": "文件不存在"}
+            import subprocess
+            subprocess.Popen(["open", str(p)])
+            return {"ok": True, "name": p.name}
         except Exception as e:
             return {"error": str(e)}
 
@@ -1018,6 +1147,18 @@ class Api:
         except Exception as e:
             log("copy_text error: " + str(e))
             return "error"
+
+    def open_url(self, url):
+        """用系统默认浏览器打开 URL（产物中的链接点击）。"""
+        import subprocess
+        if not url or not url.startswith(("http://", "https://")):
+            return {"error": "不是有效的 HTTP/HTTPS 链接"}
+        try:
+            subprocess.Popen(["open", url])
+            return {"ok": True}
+        except Exception as e:
+            log("open_url error: " + str(e))
+            return {"error": str(e)}
 
     def ocr_image(self, source):
         """识别图片中的文字（macOS Vision，支持中英文）。
@@ -1111,6 +1252,16 @@ class Api:
         except Exception:
             return
         entry = {"path": str(p), "name": p.name, "size": size, "mtime": mtime, "size_str": _fmt_size(size)}
+        # 小文本文件：如果内容只有单个 URL，标记为可点击链接
+        entry["is_url"] = False
+        if size < 4096 and p.suffix.lower() in ("", ".txt", ".md", ".url", ".link"):
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore").strip()
+                if text and text.splitlines()[0].strip().startswith(("http://", "https://")):
+                    entry["is_url"] = True
+                    entry["url"] = text.splitlines()[0].strip()
+            except Exception:
+                pass
         for i, a in enumerate(self.artifacts):
             if a["path"] == str(p):
                 self.artifacts[i] = entry
@@ -1160,20 +1311,18 @@ class Api:
         return str(result)
 
     # -------- 主循环 --------
-    def send(self, text, image=None):
+    def send(self, text, images=None):
         text = (text or "").strip()
-        if not text and not image:
+        images = images or []
+        if not text and not images:
             return "empty"
         if not self.cfg.get("api_key"):
             self.call_js("appendSystem", "未配置 API Key，请在 ~/.config/mycode/config.json 设置。")
             return "no_key"
-        if image:
-            if not _vision_cfg(self.cfg).get("api_key"):
-                self.call_js("appendSystem",
-                             "未配置千问视觉模型 Key：请在 ~/.config/mycode/config.json 增加 "
-                             "vision_api_key（或设置环境变量 DASHSCOPE_API_KEY），即可让 AI 看懂图片/文档。")
-                return "no_vision_key"
-            self._pending_image = image
+        if images:
+            self._pending_images = list(images)
+            # 配了视觉模型 Key 用视觉模型（能看画面/图表/公式）；否则回退本地 OCR（免费、纯文字截图够用）
+            self._pending_image_kind = "vision" if _vision_cfg(self.cfg).get("api_key") else "ocr"
         if not self.session_name:
             self.new_task()
         # 独立线程跑 agent loop，避免阻塞 pywebview 的 API 线程池
@@ -1185,24 +1334,72 @@ class Api:
         self._stop = False
         self._asst_open = False
         self.call_js("setBusy", True)
-        self.call_js("appendUser", text)
-        self.transcript.append({"role": "user", "text": text, "image": bool(self._pending_image)})
+        self.call_js("appendUser", text, len(self._pending_images))
+        self.transcript.append({"role": "user", "text": text, "image": len(self._pending_images)})
         try:
-            if self._pending_image:
+            if self._pending_images and self._pending_image_kind == "vision":
                 self._vision_loop(text)
+            elif self._pending_images:
+                self._ocr_then_agent(text)
             else:
                 self._agent_loop(text)
         finally:
-            self._pending_image = None
+            self._pending_images = []
+            self._pending_image_kind = None
             self.call_js("setBusy", False)
             self._save()
             self.call_js("afterSend")
 
-    def _vision_loop(self, user_input):
-        """多模态单轮：把图片/PDF 与历史文字上下文一起发给千问 VL。"""
-        image = self._pending_image
+    def _ocr_then_agent(self, user_input):
+        """无视觉模型 Key 时的兜底：本地 macOS Vision OCR 提取附件文字，
+        拼进用户消息后走正常 DeepSeek agent loop（免费、纯本地、截图/文档文字场景够用）。"""
+        images = self._pending_images
+        self.call_js("appendSystem", "未配置视觉模型，改用本地 OCR 提取附件文字…")
+        ocr_texts = []
         try:
-            content = _build_vision_content(user_input, image)
+            for idx, image in enumerate(images, 1):
+                if not image:
+                    continue
+                tag = f"[图片{idx}] " if len(images) > 1 else ""
+                if image.startswith("data:application/pdf"):
+                    import base64
+                    _, _, b64 = image.partition(",")
+                    pages = _pdf_to_image_dataurls(base64.b64decode(b64))
+                    for i, p in enumerate(pages, 1):
+                        r = self.ocr_image(p)
+                        if r.get("text"):
+                            ocr_texts.append(f"{tag}[第{i}页]\n{r['text']}")
+                elif image.startswith("data:image/"):
+                    r = self.ocr_image(image)
+                    if r.get("error"):
+                        self.call_js("appendSystem", f"OCR 失败：{r['error']}")
+                    elif r.get("text"):
+                        ocr_texts.append(tag + r["text"])
+        except Exception as e:
+            self.call_js("appendSystem", f"OCR 处理失败：{e}")
+
+        ocr_joined = "\n\n".join(ocr_texts).strip()
+        if not ocr_joined:
+            self.call_js("appendSystem",
+                         "本地 OCR 未识别到文字（可能是纯图像/图表）。如需看懂画面本身，"
+                         "请在 ~/.config/mycode/config.json 配置 vision_api_key 启用视觉模型。")
+        # 组装注入了 OCR 结果的用户消息，交给正常 agent loop
+        if ocr_joined:
+            merged = (
+                f"{user_input}\n\n"
+                f"[以下是我随消息附带的图片/文档，通过本地 OCR 提取出的文字内容，请据此理解并回答]\n"
+                f"```\n{ocr_joined}\n```"
+            )
+        else:
+            merged = user_input
+        self._agent_loop(merged)
+
+    def _vision_loop(self, user_input):
+        """多模态单轮：把图片/PDF（支持多张）与历史文字上下文一起发给视觉模型。"""
+        images = self._pending_images
+        v = _vision_cfg(self.cfg)
+        try:
+            content = _build_vision_content(user_input, images)
         except Exception as e:
             self.call_js("appendSystem", f"附件处理失败：{e}")
             return
@@ -1213,12 +1410,15 @@ class Api:
             reply = stream_vision(messages, self.cfg, VISION_MAX_TOKENS, on_text=self._on_text)
         except Exception as e:
             self.call_js("appendSystem", f"视觉模型调用失败：{e}")
+            # 视觉失败自动降级到本地 OCR 兜底，尽量不丢失用户意图
+            self.call_js("appendSystem", "尝试用本地 OCR 文字兜底…")
+            self._ocr_then_agent(user_input)
             return
         # 存档：图片/文档只在当前轮参与；history 存纯文字，保证后续 DeepSeek 上下文兼容
         self.history.append({"role": "user", "content": user_input})
         self.history.append({"role": "assistant", "content": reply})
         self.transcript.append({"role": "assistant", "text": reply})
-        self.call_js("appendSystem", "完成（已用视觉模型理解图片/文档）")
+        self.call_js("appendSystem", f"完成（已用视觉模型 {v['provider']}/{v['model']} 理解图片/文档）")
 
     def _agent_loop(self, user_input):
         self._stop = False
@@ -1301,15 +1501,64 @@ class Api:
 # --------------------------------------------------------------------------
 def main():
     try:
-        import traceback
+        import traceback, time, glob, os
         log("main: importing webview ok")
         api = Api()
         here = Path(__file__).resolve().parent
         index = here / "index.html"
         log("main: index path = " + str(index))
+        # 将 CSS/JS 直接内联到 HTML，避免 WebKit 主文档缓存 & 跨源错误脱敏
+        html = index.read_text(encoding="utf-8")
+        css = (here / "style.css").read_text(encoding="utf-8")
+        js = (here / "app.js").read_text(encoding="utf-8")
+        html = re.sub(
+            r'<link rel="stylesheet" href="style\.css[^"]*"\s*/?>',
+            lambda m: f"<style>\n{css}\n</style>",
+            html,
+        )
+        js_safe = js.replace("</script>", "<\\/script>")
+        html = re.sub(
+            r'<script src="app\.js[^"]*"></script>',
+            lambda m: f"<script>\n{js_safe}\n</script>",
+            html,
+        )
+        log("main: inlined css/js, html length = " + str(len(html)))
+        # 把 AppIcon.icns 提取成 base64 PNG，注入 HTML 顶栏 logo
+        icon_b64 = ""
+        icns_path = here.parent / "AppIcon.icns"  # AppIcon.icns 在 Resources/ 下，不是 app/ 下
+        if icns_path.exists():
+            try:
+                from PIL import Image
+                import base64, io
+                img = Image.open(icns_path).convert("RGBA")
+                # 取最大尺寸再缩到 96px，足够 Retina 显示
+                src = max(img.size) if hasattr(img, "size") and img.size else 1024
+                if isinstance(src, tuple):
+                    src = src[0]
+                img2 = img.resize((96, 96), Image.LANCZOS)
+                buf = io.BytesIO()
+                img2.save(buf, format="PNG")
+                icon_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+                log("main: icon embedded (%d bytes)" % len(icon_b64))
+            except Exception as e:
+                log("main: icon embed failed: " + str(e))
+        html = html.replace("{{APP_ICON}}", icon_b64)
+        # 把内联后的 HTML 写到 /tmp 临时文件，用 file:// 加载：
+        # 1) 文档 origin 是 file://，JS 错误不会被 WebKit 跨源脱敏（之前 "Script error. @ ?:0:0" 就是这原因）
+        # 2) 文件名带 pid+ts 每次都不同，根除 WebKit 主文档缓存
+        # 3) 启动时清理旧的 mycodex_*.html，避免 /tmp 堆积
+        for old in glob.glob("/tmp/mycodex_*.html"):
+            try:
+                if os.path.getmtime(old) < time.time() - 3600:
+                    os.remove(old)
+            except Exception:
+                pass
+        tmp_html = f"/tmp/mycodex_{os.getpid()}_{int(time.time()*1000)}.html"
+        Path(tmp_html).write_text(html, encoding="utf-8")
+        log("main: tmp html = " + tmp_html)
         webview.create_window(
             APP_NAME,
-            str(index),
+            url="file://" + tmp_html,
             js_api=api,
             width=1120,
             height=740,

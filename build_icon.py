@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""生成 MyCodex 科技感 macOS 应用图标 (.icns)——更亮、霓虹紫/青渐变 + 光晕 + 点阵。"""
+"""生成 MyCodex macOS 应用图标 (.icns) v2。
+以用户提供的桌面图标（紫渐变 + 白色 </>）为底：
+- 背景：垂直紫渐变（上 #4E5AC4 -> 下 #BA25AE，由原图线性拟合还原）
+- 符号：白色 </> 倾斜 45° 并放大（1.25x），整体居中比例协调
+- 圆角：225px（约 0.22 * 1024），与原图一致
+"""
 import os
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -10,37 +15,101 @@ OUT_DIR = "/tmp/mycodex_iconbuild"
 ICONSET = os.path.join(OUT_DIR, "AppIcon.iconset")
 os.makedirs(ICONSET, exist_ok=True)
 
+# 垂直渐变线性拟合参数：c = b*y + d（x 方向无变化）
+GRAD = {
+    "R": (0.1156, 76.1),
+    "G": (-0.0573, 92.0),
+    "B": (-0.0234, 196.9),
+}
+RADIUS = 225          # 圆角半径
+ROTATE_DEG = 45       # 代码符号倾斜角度
+SCALE = 1.45          # 相对原图符号的放大倍数（1.25 -> 1.45，更大）
+ORIG_GLYPH_H = 300    # 原图符号像素高度
 
-def vgradient(size, stops):
-    """多段垂直渐变。"""
-    px = []
-    for y in range(size):
-        t = y / (size - 1)
-        col = stops[-1][1]
-        for i in range(len(stops) - 1):
-            p0, c0 = stops[i]
-            p1, c1 = stops[i + 1]
-            if p0 <= t <= p1:
-                local = (t - p0) / (p1 - p0) if p1 > p0 else 0
-                col = tuple(int(c0[j] + (c1[j] - c0[j]) * local) for j in range(3))
-                break
-        px.extend([col] * size)
-    img = Image.new("RGB", (size, size))
-    img.putdata(px)
-    return img
+
+def load_font(size):
+    try:
+        return ImageFont.truetype(FONT_PATH, size)
+    except Exception:
+        return ImageFont.load_default()
 
 
 def rounded_mask(size, radius):
     m = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(m).rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=255)
+    ImageDraw.Draw(m).rounded_rectangle([0, 0, size - 1, size - 1],
+                                        radius=radius, fill=255)
     return m
 
 
-def alpha_clip(src, mask):
-    """把 src 的 alpha 通道限制在 mask 形状内。"""
-    r, g, b, a = src.split()
-    a = ImageChops_min(a, mask)
-    return Image.merge("RGBA", (r, g, b, a))
+def _paste_at(layer, x, y):
+    """把 RGBA layer 放到 (x,y)，返回与画布同尺寸的合成层。"""
+    out = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+    out.paste(layer, (x, y), layer)
+    return out
+
+
+def main():
+    # 1) 背景：垂直紫渐变（带圆角遮罩）
+    bg = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+    bp = bg.load()
+    for y in range(SIZE):
+        r = max(0, min(255, int(GRAD["R"][0] * y + GRAD["R"][1])))
+        g = max(0, min(255, int(GRAD["G"][0] * y + GRAD["G"][1])))
+        b = max(0, min(255, int(GRAD["B"][0] * y + GRAD["B"][1])))
+        for x in range(SIZE):
+            bp[x, y] = (r, g, b, 255)
+    mask = rounded_mask(SIZE, RADIUS)
+    r, g, b, a = bg.split()
+    bg = Image.merge("RGBA", (r, g, b, ImageChops_min(a, mask)))
+
+    # 2) 渲染 </>：目标高度 = 原图符号高 * 放大倍数
+    font = load_font(470)
+    glyph = "</>"
+    tmp = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+    ImageDraw.Draw(tmp).text((SIZE // 2, SIZE // 2), glyph, font=font,
+                             fill=(255, 255, 255, 255), anchor="mm")
+    bb = tmp.getbbox()
+    w0, h0 = bb[2] - bb[0], bb[3] - bb[1]
+    target_h = int(ORIG_GLYPH_H * SCALE)
+    scale = target_h / h0
+    sym = tmp.crop(bb).resize((max(1, int(w0 * scale)), target_h), Image.LANCZOS)
+
+    # 3) 倾斜 45°（expand 保留完整，透明边缘）
+    sym = sym.rotate(ROTATE_DEG, expand=True, resample=Image.BICUBIC)
+    sx = (SIZE - sym.width) // 2
+    sy = (SIZE - sym.height) // 2
+
+    # 3.1) 投影阴影：暗色模糊副本，向下偏移，给符号立体感
+    w0, h0 = sym.size
+    sh = sym.split()[3].point(lambda a: int(a * 0.60))
+    shadow = Image.merge("RGBA", (Image.new("L", (w0, h0), 20),
+                                  Image.new("L", (w0, h0), 10),
+                                  Image.new("L", (w0, h0), 40),
+                                  sh)).filter(ImageFilter.GaussianBlur(radius=20))
+    bg = Image.alpha_composite(bg, _paste_at(shadow, sx + int(SIZE * 0.014), sy + int(SIZE * 0.026)))
+
+    # 3.2) 柔和外发光：浅紫光晕包裹符号，融入背景（不再生硬贴上去）
+    ga = sym.split()[3].point(lambda a: int(a * 0.45))
+    glow = Image.merge("RGBA", (Image.new("L", (w0, h0), 214),
+                                Image.new("L", (w0, h0), 186),
+                                Image.new("L", (w0, h0), 255),
+                                ga)).filter(ImageFilter.GaussianBlur(radius=26))
+    bg = Image.alpha_composite(bg, _paste_at(glow, sx, sy))
+
+    # 3.3) 白色主体
+    bg = Image.alpha_composite(bg, _paste_at(sym, sx, sy))
+
+    # 4) 导出各尺寸 iconset
+    specs = [
+        ("icon_16x16.png", 16), ("icon_16x16@2x.png", 32),
+        ("icon_32x32.png", 32), ("icon_32x32@2x.png", 64),
+        ("icon_128x128.png", 128), ("icon_128x128@2x.png", 256),
+        ("icon_256x256.png", 256), ("icon_256x256@2x.png", 512),
+        ("icon_512x512.png", 512), ("icon_512x512@2x.png", 1024),
+    ]
+    for name, s in specs:
+        bg.resize((s, s), Image.LANCZOS).save(os.path.join(ICONSET, name))
+    print("iconset generated:", ICONSET)
 
 
 def ImageChops_min(a, b):
@@ -52,150 +121,6 @@ def ImageChops_min(a, b):
         for x in range(a.size[0]):
             po[x, y] = min(pa[x, y], pb[x, y])
     return out
-
-
-def radial_glow(size, center, radius, color, alpha):
-    """中心径向光晕。"""
-    glow = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(glow)
-    steps = int(radius / 2)
-    for i in range(steps, 0, -1):
-        t = i / steps
-        a = int(alpha * (1 - t * t))
-        if a <= 2:
-            continue
-        r = radius * t
-        c = color + (a,)
-        d.ellipse(
-            [center[0] - r, center[1] - r, center[0] + r, center[1] + r],
-            outline=c,
-            width=2,
-        )
-    return glow.filter(ImageFilter.GaussianBlur(radius=max(10, radius / 8)))
-
-
-def grid_overlay(size, color, alpha, step=64, dot=4):
-    """底部点阵网格。"""
-    grid = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(grid)
-    half = size // 2
-    for x in range(step, size, step):
-        for y in range(step, size, step):
-            dx = abs(x - half) / half
-            dy = abs(y - half) / half
-            fade = max(0, 1 - (dx + dy) / 1.4)
-            if fade <= 0.05:
-                continue
-            c = color + (int(alpha * fade),)
-            d.ellipse([x - dot, y - dot, x + dot, y + dot], fill=c)
-    return grid
-
-
-def top_sheen(size, mask):
-    """顶部强柔光。"""
-    sheen = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(sheen)
-    h = size // 3
-    for y in range(h):
-        t = y / h
-        a = int(130 * (1 - t ** 0.65))
-        if a > 0:
-            d.line([(0, y), (size - 1, y)], fill=(255, 255, 255, a))
-    sheen = sheen.filter(ImageFilter.GaussianBlur(radius=4))
-    return alpha_clip(sheen, mask)
-
-
-def bottom_glow(size, color, alpha):
-    """底部水平反光。"""
-    layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    start = size * 2 // 3
-    for y in range(start, size):
-        t = (y - start) / (size - start)
-        a_val = int(alpha * (1 - t))
-        if a_val > 0:
-            d.line([(0, y), (size - 1, y)], fill=color + (a_val,))
-    return layer.filter(ImageFilter.GaussianBlur(radius=10))
-
-
-def load_font(size):
-    try:
-        return ImageFont.truetype(FONT_PATH, size)
-    except Exception:
-        return ImageFont.load_default()
-
-
-def main():
-    radius = int(SIZE * 0.22)
-    mask = rounded_mask(SIZE, radius)
-
-    # 1) 更亮的科技感渐变：靛蓝紫 -> 电光紫 -> 亮粉 -> 科技青
-    grad = vgradient(SIZE, [
-        (0.0, (58, 48, 210)),    # 靛蓝紫
-        (0.32, (124, 58, 237)),  # 电光紫
-        (0.62, (192, 38, 211)),  # 亮粉
-        (1.0, (6, 182, 212)),    # 科技青
-    ])
-
-    bg = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
-    bg.paste(grad, (0, 0), mask)
-
-    # 2) 中央紫色光晕
-    glow = radial_glow(SIZE, (SIZE // 2, SIZE // 2 - 30), SIZE * 0.55, (168, 85, 247), 150)
-    bg = Image.alpha_composite(bg, alpha_clip(glow, mask))
-
-    # 3) 底部点阵网格
-    grid = grid_overlay(SIZE, (255, 255, 255), 45, step=56, dot=3)
-    bg = Image.alpha_composite(bg, alpha_clip(grid, mask))
-
-    # 4) 底部青色反光
-    bg = Image.alpha_composite(bg, alpha_clip(bottom_glow(SIZE, (34, 211, 238), 70), mask))
-
-    # 5) 顶部强高光
-    bg = Image.alpha_composite(bg, top_sheen(SIZE, mask))
-
-    # 6) 内发光描边
-    inner = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
-    d = ImageDraw.Draw(inner)
-    d.rounded_rectangle(
-        [6, 6, SIZE - 7, SIZE - 7],
-        radius=radius - 2,
-        outline=(255, 255, 255, 45),
-        width=3,
-    )
-    bg = Image.alpha_composite(bg, inner)
-
-    # 7) </> 字形：紫色外发光 + 白色主体
-    font = load_font(int(SIZE * 0.40))
-    glyph = "</>"
-
-    glow_text = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
-    d = ImageDraw.Draw(glow_text)
-    d.text((SIZE // 2, SIZE // 2), glyph, font=font, fill=(192, 132, 252, 220), anchor="mm")
-    glow_text = glow_text.filter(ImageFilter.GaussianBlur(radius=20))
-    bg = Image.alpha_composite(bg, glow_text)
-
-    d = ImageDraw.Draw(bg)
-    d.text((SIZE // 2, SIZE // 2), glyph, font=font, fill=(255, 255, 255, 255), anchor="mm")
-
-    # 8) 导出各尺寸到 iconset
-    specs = [
-        ("icon_16x16.png", 16),
-        ("icon_16x16@2x.png", 32),
-        ("icon_32x32.png", 32),
-        ("icon_32x32@2x.png", 64),
-        ("icon_128x128.png", 128),
-        ("icon_128x128@2x.png", 256),
-        ("icon_256x256.png", 256),
-        ("icon_256x256@2x.png", 512),
-        ("icon_512x512.png", 512),
-        ("icon_512x512@2x.png", 1024),
-    ]
-    for name, s in specs:
-        img = bg.resize((s, s), Image.LANCZOS)
-        img.save(os.path.join(ICONSET, name))
-
-    print("iconset generated:", ICONSET)
 
 
 if __name__ == "__main__":

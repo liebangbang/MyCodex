@@ -3,15 +3,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <title>MyCodex</title>
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=3" />
 </head>
 <body>
   <div class="app">
     <!-- 顶栏 -->
     <header class="topbar">
       <div class="brand">
-        <div class="logo">&lt;/&gt;</div>
+        <img class="logo" src="{{APP_ICON}}" alt="MyCodex" />
         <span class="brand-name">MyCodex</span>
       </div>
       <div class="task-title" id="taskTitle">未命名任务</div>
@@ -54,38 +57,38 @@
         <div class="composer">
           <div class="composer-bar">
             <select id="modelSel" class="select" title="模型">
-              <option value="deepseek-v4-flash">Flash</option>
-              <option value="deepseek-v4-pro">Pro</option>
+              <option value="deepseek-v4-flash">深度·Flash</option>
+              <option value="deepseek-v4-pro">深度·Pro</option>
+              <option value="qwen3.8-max">通义·3.8 Max</option>
+              <option value="qwen3.7-flash">通义·3.7 Flash</option>
+              <option value="qwen-plus">通义·Plus</option>
             </select>
             <select id="thinkSel" class="select" title="思考模式">
               <option value="off">思考 关</option>
               <option value="auto">思考 自动</option>
               <option value="on">思考 开</option>
             </select>
-            <span class="cwd" id="cwdText" title="工作目录"></span>
+            <button class="icon-btn" id="btnImg" title="添加文件 / 图片 / PDF（AI 可理解内容）">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M9 13h6M9 16.5h4"/></svg>
+            </button>
           </div>
           <div class="composer-input">
             <textarea id="input" rows="1" placeholder="输入任务指令…  (Enter 换行 · ⌘/Ctrl+Enter 发送 · 可粘贴/拖拽图片)"></textarea>
             <div class="composer-btns">
-              <button class="icon-btn" id="btnImg" title="添加图片/PDF（AI 可理解内容）">
-                <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="m21 15-5-5-9 9"/></svg>
-              </button>
+              <span class="cwd" id="cwdText" title="工作目录"></span>
               <button class="btn stop" id="btnStop" style="display:none">停止</button>
               <button class="btn primary" id="btnSend" title="发送 (⌘/Ctrl+Enter)">发送</button>
             </div>
           </div>
           <div class="img-preview" id="imgPreview" style="display:none">
-            <img id="imgThumb" alt="附件预览" />
-            <div class="img-meta">
-              <div class="img-name" id="imgName"></div>
-              <div class="img-hint" id="imgHint"></div>
+            <div class="img-thumbs" id="imgThumbs"></div>
+            <div class="img-actions">
+              <span class="img-hint" id="imgHint"></span>
+              <button class="btn ghost small" id="btnOcr" title="提取图片中的文字到输入框">识别文字</button>
+              <button class="btn ghost small" id="btnImgCancel" title="移除全部附件">移除</button>
             </div>
-            <button class="btn ghost small" id="btnOcr" title="仅提取图片中的文字到输入框">识别文字</button>
-            <button class="icon-btn" id="btnImgCancel" title="移除附件">
-              <svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
-            </button>
           </div>
-          <input type="file" id="fileImg" accept="image/*,.pdf" style="display:none" />
+          <input type="file" id="fileImg" accept="image/*,.pdf" multiple style="display:none" />
         </div>
       </main>
 
@@ -120,6 +123,6 @@
     </div>
   </div>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=3"></script>
 </body>
 </html>

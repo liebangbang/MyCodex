@@ -58,7 +58,9 @@
     return String(s == null ? "" : s)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   // 简易 Markdown：围栏代码块 + 行内代码
@@ -162,13 +164,34 @@
   }
 
   // ---------------- 消息渲染 ----------------
-  function appendUser(text) {
+  // 本次发送的图片缩略图（doSend 时保存，appendUser 时消费展示；重放无缩略图则用数量徽章）
+  let _pendingThumbs = [];
+  function appendUser(text, imgCount) {
     finalizeAssistant();
     const m = document.createElement("div");
     m.className = "msg user";
     const b = document.createElement("div");
     b.className = "bubble";
-    b.textContent = text || "🖼️ 发送了图片/文档";
+    let inner = "";
+    if (text) {
+      inner += '<div class="user-text">' + esc(text).replace(/\n/g, "<br>") + "</div>";
+    }
+    if (imgCount) {
+      const thumbs = _pendingThumbs;
+      _pendingThumbs = [];
+      if (thumbs.length) {
+        inner += '<div class="user-thumbs">' + thumbs.map((th) => {
+          if (th.kind === "pdf") {
+            return '<span class="user-thumb file">PDF</span>';
+          }
+          return '<img class="user-thumb" src="' + th.dataUrl + '" alt="图片" />';
+        }).join("") + "</div>";
+      } else {
+        inner += '<div class="user-img-badge">🖼️ 附 ' + imgCount + " 张图片/文档</div>";
+      }
+    }
+    if (!inner) inner = "（空消息）";
+    b.innerHTML = inner;
     m.appendChild(b);
     messagesEl.appendChild(m);
     scrollDown();
@@ -212,24 +235,74 @@
     scrollDown();
   }
 
+  // ---------- 工具调用：紧凑单行卡片 ----------
+  // 智能提取关键参数：write_file→文件名 / run_command→命令 / read_file→路径 …
+  function toolBasename(p) { return String(p == null ? "" : p).split("/").pop(); }
+  function smartToolArgs(name, summary) {
+    let s = String(summary == null ? "" : summary).trim();
+    if (!s) return "";
+    let obj = null;
+    try { obj = JSON.parse(s); } catch (e) {}
+    if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+      if (name === "write_file" || name === "edit_file") s = "→ " + toolBasename(obj.path);
+      else if (name === "read_file") s = "→ " + toolBasename(obj.path);
+      else if (name === "run_command") s = "$ " + String(obj.command || "").slice(0, 60);
+      else if (name === "list_dir") s = "→ " + (toolBasename(obj.path) || obj.path || "");
+      else if (name === "grep_files") s = "/" + (obj.pattern || "") + "/ → " + (toolBasename(obj.path) || obj.path || "");
+      else {
+        const keys = Object.keys(obj).slice(0, 2);
+        s = keys.map(k => k + "=" + String(obj[k]).slice(0, 30)).join(" ") + (Object.keys(obj).length > 2 ? " …" : "");
+        if (s.length > 80) s = s.slice(0, 80) + " …";
+      }
+    } else {
+      if (s.length > 60) s = s.slice(0, 60) + " …";
+    }
+    return s;
+  }
+
   function appendTool(name, summary) {
     finalizeAssistant();
     const card = document.createElement("div");
     card.className = "tool-card";
+    const args = smartToolArgs(name, summary);
     card.innerHTML =
       '<div class="tool-head"><span class="tool-dot"></span>' +
-      "<span>" + esc(name) + '</span><span class="tool-summary">' + esc(summary) + "</span></div>" +
+      '<span class="tool-name">' + esc(name) + "</span>" +
+      (args ? '<span class="tool-args">' + esc(args) + "</span>" : "") +
+      '<span class="tool-status" style="display:none"></span>' +
+      '<svg class="tool-caret" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>' +
+      "</div>" +
       '<div class="tool-result" style="display:none"></div>';
     messagesEl.appendChild(card);
+    // 点击展开/收起完整结果
+    card.addEventListener("click", () => {
+      const r = card.querySelector(".tool-result");
+      const open = r.style.display !== "none";
+      r.style.display = open ? "none" : "block";
+      card.classList.toggle("open", !open);
+      scrollDown();
+    });
     currentToolCard = card;
     scrollDown();
   }
 
   function appendToolResult(name, summary, result) {
     const card = currentToolCard || (function () { appendTool(name, summary); return currentToolCard; })();
+    // 状态徽章：结果第一行，超长截断；完整结果存在 title 悬停可见
+    const first = String(result || "").split("\n")[0].slice(0, 56);
+    const st = card.querySelector(".tool-status");
+    if (first.trim()) {
+      st.style.display = "";
+      st.textContent = "✓ " + first;
+      st.title = String(result || "");
+    } else {
+      st.style.display = "";
+      st.textContent = "✓";
+    }
     const r = card.querySelector(".tool-result");
-    r.style.display = "block";
     r.textContent = result;
+    const isErr = /error|failed|拒绝|失败|exit code: [1-9]|timeout|超时/i.test(String(result || "").slice(0, 300));
+    st.classList.toggle("err", isErr);
     scrollDown();
   }
 
@@ -240,25 +313,64 @@
     list.forEach((a) => artListEl.appendChild(makeArtItem(a)));
   }
 
+  function openInBrowser(url) {
+    if (!apiReady()) return;
+    window.pywebview.api.open_url(url).then((res) => {
+      if (res && res.error) appendSystem("无法打开链接：" + res.error);
+    });
+  }
+
   function makeArtItem(a) {
     const item = document.createElement("div");
     item.className = "art-item";
     item.dataset.path = a.path;
     const ext = (a.name.split(".").pop() || "").toLowerCase();
     let cls = "";
-    if (ext === "md" || ext === "txt") cls = "green";
-    else if (ext === "json" || ext === "yml" || ext === "yaml") cls = "amber";
+    let iconSvg = '<svg class="icon" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>';
+    if (a.is_url) {
+      cls = "url";
+      iconSvg = '<svg class="icon" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>';
+    } else if (ext === "md" || ext === "markdown") {
+      cls = "green";
+      iconSvg = '<svg class="icon" viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="m8 15 2-2 2 2 3-3"/></svg>';
+    } else if (ext === "html" || ext === "htm") {
+      cls = "blue";
+      iconSvg = '<svg class="icon" viewBox="0 0 24 24"><path d="M9 8 5 12l4 4"/><path d="m15 8 4 4-4 4"/><path d="m13 5-2 14"/></svg>';
+    } else if (ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif" || ext === "webp" || ext === "svg" || ext === "bmp") {
+      cls = "pink";
+      iconSvg = '<svg class="icon" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="m21 15-5-5-9 9"/></svg>';
+    } else if (ext === "pdf") {
+      cls = "red";
+      iconSvg = '<svg class="icon" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M9 13h6M9 16.5h4"/></svg>';
+    } else if (ext === "json" || ext === "yml" || ext === "yaml") {
+      cls = "amber";
+    }
     const icon = document.createElement("div");
     icon.className = "art-icon " + cls;
-    icon.innerHTML =
-      '<svg class="icon" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>';
+    icon.innerHTML = iconSvg;
     const meta = document.createElement("div");
     meta.className = "art-meta";
     meta.innerHTML =
       '<div class="art-name">' + esc(a.name) + "</div>" +
-      '<div class="art-sub">' + esc(a.size_str || (a.size + "B")) + "</div>";
+      '<div class="art-sub">' + (a.is_url ? esc(a.url || "链接") : esc(a.size_str || (a.size + "B"))) + "</div>";
     item.appendChild(icon);
     item.appendChild(meta);
+
+    // 链接 / 图片 / 网页 / PDF 提供“在浏览器打开”
+    const openable = a.is_url || ["md", "markdown", "html", "htm", "pdf", "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"].indexOf(ext) > -1;
+    if (openable) {
+      const openBtn = document.createElement("button");
+      openBtn.className = "icon-btn art-open";
+      openBtn.title = "在浏览器打开";
+      openBtn.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="m21 3-7 7"/></svg>';
+      openBtn.onclick = (e) => {
+        e.stopPropagation();
+        if (a.is_url) openInBrowser(a.url || a.path);
+        else if (apiReady()) window.pywebview.api.open_external(a.path);
+      };
+      item.appendChild(openBtn);
+    }
+
     item.onclick = () => {
       document.querySelectorAll(".art-item").forEach((x) => x.classList.remove("active"));
       item.classList.add("active");
@@ -288,11 +400,190 @@
         previewEl.innerHTML = '<div class="preview-empty">' + esc(res.error) + "</div>";
         return;
       }
-      previewEl.innerHTML =
-        '<div class="preview-head">' + esc(res.name) + "  ·  " + esc(String(res.size)) + "B</div>" +
-        esc(res.content);
+      renderPreview(res);
       previewEl.scrollTop = 0;
     });
+  }
+
+  // 当前预览视图模式："source"（源码）| "rendered"（渲染）
+  // HTML 默认源码（避免自身递归 / 复杂页面乱码），MD 默认渲染
+  let _previewView = "source";
+  let _previewing = null;  // 当前预览的产物对象（切换视图时复用）
+
+  // 检测 MyCodex 自身的 HTML：含任务面板 + 消息区两个特征 id 即视为 app 自身源码
+  function isSelfRefHtml(a) {
+    if (a.kind !== "html") return false;
+    const c = a.content || "";
+    return /id="taskList"/.test(c) && /id="messages"/.test(c);
+  }
+
+  function previewToolbar(a) {
+    // 预览区右上角按钮：源码↔渲染切换 + 在浏览器打开
+    let html = "";
+    if (a.kind === "html") {
+      // MyCodex 自身 HTML：禁用渲染切换（递归会乱码），仅显示"在浏览器打开"
+      if (!isSelfRefHtml(a)) {
+        const isSource = _previewView === "source";
+        html += '<button class="btn ghost small view-toggle" data-act="view" title="切换源码/渲染视图">' +
+          (isSource
+            ? '<svg class="icon" viewBox="0 0 24 24"><path d="m21 3-7 7"/><path d="m21 3-5 11-3-4-4-3z"/><path d="M14 3h7v7"/></svg>渲染'
+            : '<svg class="icon" viewBox="0 0 24 24"><path d="m16 18 6-6"/><path d="m8 6 6 6"/><path d="m2 12 6 6"/><path d="m16 6 6 6"/><path d="m8 18 6-6"/></svg>源码') +
+          '</button>';
+      }
+    } else if (a.kind === "md") {
+      const isSource = _previewView === "source";
+      html += '<button class="btn ghost small view-toggle" data-act="view" title="切换源码/渲染视图">' +
+        (isSource ? '渲染' : '源码') + '</button>';
+    }
+    if (a.kind !== "text" && a.kind !== "binary") {
+      html += '<button class="btn ghost small open-btn" data-act="open">' +
+        '<svg class="icon" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><path d="M15 3h6v6"/><path d="m21 3-7 7"/></svg>' +
+        "在浏览器打开</button>";
+    }
+    return html;
+  }
+
+  function renderPreview(a) {
+    // 新文件预览：HTML 走源码、MD 走渲染（更安全稳定）
+    if (a.kind === "html") _previewView = "source";
+    else if (a.kind === "md") _previewView = "rendered";
+    _previewing = a;
+    const selfRef = isSelfRefHtml(a);
+    const titleSuffix = selfRef ? ' · <span class="preview-hint-inline">MyCodex 自身源码（仅源码）</span>' : "";
+    const head =
+      '<div class="preview-head">' +
+        '<span class="preview-title">' + esc(a.name) + "  ·  " +
+          (a.kind === "image" ? "图片" : a.kind === "html" ? "网页" : a.kind === "md" ? "Markdown" :
+           a.kind === "pdf" ? "PDF 文档" : a.kind === "binary" ? "文件" : esc(a.size_str || String(a.size) + "B")) +
+          titleSuffix +
+        "</span>" +
+        previewToolbar(a) +
+      "</div>";
+    previewEl.innerHTML = head + renderPreviewBody(a);
+    // 绑定所有按钮
+    previewEl.querySelectorAll("[data-act]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const act = btn.dataset.act;
+        if (act === "url") openInBrowser(a.url || a.content);
+        else if (act === "view") togglePreviewView();
+        else if (apiReady()) window.pywebview.api.open_external(a.path);
+      });
+    });
+  }
+
+  function renderPreviewBody(a) {
+    const view = _previewView;
+    if (a.kind === "image") {
+      return '<img class="preview-img" src="' + a.data_url + '" alt="' + esc(a.name) + '" />';
+    } else if (a.kind === "html") {
+      if (view === "rendered") {
+        return '<iframe class="preview-frame" sandbox="allow-same-origin allow-scripts" srcdoc="' + esc(a.content) + '"></iframe>';
+      }
+      return '<pre class="preview-content">' + esc(a.content) + "</pre>";
+    } else if (a.kind === "md") {
+      if (view === "source") {
+        return '<pre class="preview-content">' + esc(a.content) + "</pre>";
+      }
+      return '<div class="preview-md">' + renderMarkdownFull(a.content) + "</div>";
+    } else if (a.kind === "pdf") {
+      return '<div class="preview-file">' +
+        '<svg class="icon big" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>' +
+        "<div>PDF 文档</div>" +
+        '<div class="preview-hint">' + esc(a.hint || "点击下方按钮在浏览器中打开") + "</div>" +
+        '<button class="btn primary" data-act="open">在浏览器打开</button>' +
+      "</div>";
+    } else if (a.kind === "binary") {
+      return '<div class="preview-file">' +
+        '<svg class="icon big" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>' +
+        "<div>二进制文件</div>" +
+        '<div class="preview-hint">' + esc(a.hint || "无法直接预览，请在浏览器/默认应用中打开") + "</div>" +
+        '<button class="btn primary" data-act="open">用系统应用打开</button>' +
+      "</div>";
+    } else if (a.is_url) {
+      return
+        '<div class="url-card">' +
+          '<div class="url-row">' +
+            '<svg class="icon" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>' +
+            '<span class="url-text">' + esc(a.url || a.content) + "</span>" +
+          "</div>" +
+          '<button class="btn primary" data-act="url">在浏览器打开</button>' +
+        "</div>";
+    }
+    return '<pre class="preview-content">' + esc(a.content) + "</pre>";
+  }
+
+  function togglePreviewView() {
+    if (!_previewing) return;
+    _previewView = _previewView === "source" ? "rendered" : "source";
+    // 替换 body 与 toolbar（head 标题保持）
+    const head = previewEl.querySelector(".preview-head");
+    if (!head) return;
+    const newBody = renderPreviewBody(_previewing);
+    // 替换 head 内的 toolbar（title 保留，按钮更新）
+    const newToolbar = previewToolbar(_previewing);
+    // 先清掉预览体（除 head 之外）
+    Array.from(previewEl.children).forEach((c) => { if (c !== head) c.remove(); });
+    // 包装 body 元素以便 toggle 后替换
+    const wrap = document.createElement("div");
+    wrap.className = "preview-body";
+    wrap.innerHTML = newBody;
+    previewEl.appendChild(wrap);
+    // 更新 head 里的按钮
+    const oldTitle = head.querySelector(".preview-title");
+    head.innerHTML = "";
+    head.appendChild(oldTitle);
+    head.insertAdjacentHTML("beforeend", newToolbar);
+    // 重新绑定 head 按钮
+    head.querySelectorAll("[data-act]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const act = btn.dataset.act;
+        const a = _previewing;
+        if (act === "url") openInBrowser(a.url || a.content);
+        else if (act === "view") togglePreviewView();
+        else if (apiReady()) window.pywebview.api.open_external(a.path);
+      });
+    });
+    previewEl.scrollTop = 0;
+  }
+
+  // Markdown 完整渲染（预览区用）：标题 / 列表 / 引用 / 加粗 / 链接 / 行内代码 / 代码块
+  function renderMarkdownFull(raw) {
+    const src = String(raw == null ? "" : raw);
+    // 先处理代码块，占位保护
+    const blocks = [];
+    let text = src.replace(/```([\s\S]*?)```/g, (m, code) => {
+      blocks.push('<pre class="md-code"><code>' + esc(code.replace(/^\n/, "").replace(/\n$/, "")) + "</code></pre>");
+      return "\u0000MD" + (blocks.length - 1) + "\u0000";
+    });
+    const lines = text.split("\n");
+    const html = [];
+    let inList = false, inQuote = false;
+    const closeList = () => { if (inList) { html.push("</ul>"); inList = false; } };
+    const closeQuote = () => { if (inQuote) { html.push("</blockquote>"); inQuote = false; } };
+    for (let line of lines) {
+      const inline = (s) => s
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/`([^`]+)`/g, '<code class="md-inline">$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+      const h = line.match(/^(#{1,4})\s+(.*)$/);
+      if (h) { closeList(); closeQuote(); html.push("<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">"); continue; }
+      if (/^\s*[-*+]\s+/.test(line)) {
+        if (!inList) { closeQuote(); html.push("<ul>"); inList = true; }
+        html.push("<li>" + inline(line.replace(/^\s*[-*+]\s+/, "")) + "</li>"); continue;
+      }
+      if (/^\s*>\s?/.test(line)) {
+        if (!inQuote) { closeList(); html.push("<blockquote>"); inQuote = true; }
+        html.push(inline(line.replace(/^\s*>\s?/, ""))); continue;
+      }
+      closeList(); closeQuote();
+      if (!line.trim()) { html.push(""); continue; }
+      html.push("<p>" + inline(line) + "</p>");
+    }
+    closeList(); closeQuote();
+    let out = html.join("\n");
+    out = out.replace(/\u0000MD(\d+)\u0000/g, (m, i) => blocks[+i]);
+    return out;
   }
 
   // ---------------- 任务列表 ----------------
@@ -444,8 +735,7 @@
 
   function playTranscript(entry) {
     if (entry.role === "user") {
-      appendUser(entry.text || "");
-      if (entry.image) appendSystem("📷 已附带图片/文档，交由视觉模型理解");
+      appendUser(entry.text || "", entry.image);
     }
     else if (entry.role === "assistant") { beginAssistant(); appendAssistant(entry.text || ""); finalizeAssistant(); }
     else if (entry.role === "tool") {
@@ -494,14 +784,24 @@
   }
 
   function applyState(st) {
+    const prevTask = activeTask;  // 在 setHeader 修改前捕获，供下方恢复判断使用
     setHeader(st);
+    window._visionReady = !!st.vision_ok;
     renderSessions(st.sessions || []);
     window._sessionsCache = st.sessions || [];
     renderArtifacts(st.artifacts || []);
+    // 启动时若已自动恢复上次任务，渲染其历史对话
+    if (st.session_name && st.transcript && st.transcript.length && prevTask !== st.session_name) {
+      activeTask = st.session_name;
+      clearMessages();
+      st.transcript.forEach(playTranscript);
+      renderArtifacts(st.artifacts || []);
+      highlightActive();
+    }
     if (st.need_key) {
       appendSystem("未配置 API Key，请在 ~/.config/mycode/config.json 设置 api_key。");
     } else if (st.vision_ok === false) {
-      appendSystem("提示：未配置视觉模型 Key（vision_api_key），发送图片/PDF 前请先在 config.json 设置。");
+      appendSystem("图片/PDF 将用本地 OCR 提取文字后由 AI 理解（免费、纯本地）。如需看懂画面/图表本身，可在 config.json 配置 vision_api_key 启用视觉模型。");
     }
   }
 
@@ -517,13 +817,14 @@
   // ---------------- 发送 ----------------
   function doSend() {
     const text = inputEl.value.trim();
-    const image = pendingImageDataUrl || null;
-    if ((!text && !image) || busy || !apiReady()) return;
+    const images = pendingImages.map((x) => x.dataUrl);
+    if ((!text && !images.length) || busy || !apiReady()) return;
+    _pendingThumbs = pendingImages.map((x) => ({ dataUrl: x.dataUrl, kind: x.kind }));
     inputEl.value = "";
     clearImgPreview();
     autoResize();
     setBusy(true);
-    window.pywebview.api.send(text, image).then(() => {
+    window.pywebview.api.send(text, images).then(() => {
       window.pywebview.api.init().then((st) => { applyState(st); highlightActive(); });
     }).catch((e) => { setBusy(false); appendSystem("发送失败：" + e); });
   }
@@ -537,41 +838,59 @@
     return window.pywebview && window.pywebview.api;
   }
 
-  // ---------------- 图片/文档输入（多模态） ----------------
+  // ---------------- 图片/文档输入（多模态，支持多张） ----------------
   const fileImgEl = $("fileImg");
   const imgPreviewEl = $("imgPreview");
-  const imgThumbEl = $("imgThumb");
-  const imgNameEl = $("imgName");
+  const imgThumbsEl = $("imgThumbs");
   const imgHintEl = $("imgHint");
-  let pendingImageDataUrl = null;   // data URL（图片 或 PDF）
-  let pendingFileKind = null;       // "image" | "pdf"
+  let pendingImages = [];           // [{dataUrl, name, kind}]  kind: "image" | "pdf"
   let ocrRunning = false;
 
   const PDF_ICON = "data:image/svg+xml;base64," + btoa(
     '<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#D9484F" stroke-width="1.6"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8M8 16.5h5"/></svg>'
   );
 
-  function showFilePreview(dataUrl, name, kind) {
-    pendingImageDataUrl = dataUrl;
-    pendingFileKind = kind;
-    if (kind === "pdf") {
-      imgThumbEl.src = PDF_ICON;
-      imgNameEl.textContent = name;
-      imgHintEl.textContent = "PDF 将转成图片由 AI 理解（最多前 5 页）";
+  function addPendingImage(dataUrl, name, kind) {
+    pendingImages.push({ dataUrl, name, kind });
+    renderImgThumbs();
+  }
+
+  function renderImgThumbs() {
+    imgThumbsEl.innerHTML = "";
+    pendingImages.forEach((it, idx) => {
+      const cell = document.createElement("div");
+      cell.className = "img-thumb";
+      const im = document.createElement("img");
+      if (it.kind === "pdf") im.src = PDF_ICON; else im.src = it.dataUrl;
+      cell.appendChild(im);
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = it.kind === "pdf" ? "PDF" : "图片";
+      cell.appendChild(badge);
+      const del = document.createElement("button");
+      del.className = "del";
+      del.textContent = "×";
+      del.title = "移除这张";
+      del.onclick = () => { pendingImages.splice(idx, 1); renderImgThumbs(); };
+      cell.appendChild(del);
+      imgThumbsEl.appendChild(cell);
+    });
+    if (pendingImages.length) {
+      const visionReady = !!window._visionReady;
+      imgHintEl.textContent = visionReady
+        ? `已附 ${pendingImages.length} 个文件，将用视觉模型理解画面`
+        : `已附 ${pendingImages.length} 个文件，将用本地 OCR 提取文字`;
+      imgPreviewEl.style.display = "flex";
+      imgPreviewEl.scrollIntoView({ block: "nearest" });
     } else {
-      imgThumbEl.src = dataUrl;
-      imgNameEl.textContent = name || "图片";
-      imgHintEl.textContent = "将随消息发送，AI 会理解图片内容";
+      imgPreviewEl.style.display = "none";
     }
-    imgPreviewEl.style.display = "flex";
-    imgPreviewEl.scrollIntoView({ block: "nearest" });
   }
 
   function clearImgPreview() {
-    pendingImageDataUrl = null;
-    pendingFileKind = null;
+    pendingImages = [];
+    imgThumbsEl.innerHTML = "";
     imgPreviewEl.style.display = "none";
-    imgThumbEl.removeAttribute("src");
     fileImgEl.value = "";
   }
 
@@ -580,7 +899,7 @@
     const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name || "");
     if (isPdf) {
       const reader = new FileReader();
-      reader.onload = () => showFilePreview(reader.result, file.name, "pdf");
+      reader.onload = () => addPendingImage(reader.result, file.name, "pdf");
       reader.onerror = () => appendSystem("读取 PDF 失败");
       reader.readAsDataURL(file);
       return;
@@ -590,17 +909,18 @@
       return;
     }
     const reader = new FileReader();
-    reader.onload = () => showFilePreview(reader.result, file.name, "image");
+    reader.onload = () => addPendingImage(reader.result, file.name, "image");
     reader.onerror = () => appendSystem("读取图片失败");
     reader.readAsDataURL(file);
   }
 
   // OCR：手动把图片文字提取进输入框（本地免费；不影响图片随消息发送）
   function runOcr() {
-    if (!pendingImageDataUrl) return;
+    if (!pendingImages.length) return;
     if (!apiReady()) return;
     if (ocrRunning) return;
-    if (pendingFileKind !== "image") {
+    const imgs = pendingImages.filter((x) => x.kind === "image");
+    if (!imgs.length) {
       appendSystem("OCR 仅支持图片；PDF 可直接发送给 AI 理解");
       return;
     }
@@ -608,54 +928,60 @@
     btn.disabled = true;
     const old = btn.textContent;
     btn.textContent = "识别中…";
-    window.pywebview.api.ocr_image(pendingImageDataUrl).then((res) => {
-      btn.disabled = false;
-      btn.textContent = old;
-      if (!res || res.error) {
-        appendSystem("OCR 失败：" + (res && res.error ? res.error : "未知错误"));
-        return;
-      }
-      const text = (res.text || "").trim();
-      if (!text) {
-        appendSystem("未在图片中识别到文字");
-        return;
-      }
-      const prefix = inputEl.value.trim() ? "\n\n" : "";
-      inputEl.value += prefix + "[图片OCR识别结果]\n" + text;
-      autoResize();
-      inputEl.focus();
-    }).catch((e) => {
-      btn.disabled = false;
-      btn.textContent = old;
-      appendSystem("OCR 调用失败：" + e);
+    let done = 0;
+    let collected = [];
+    imgs.forEach((it, i) => {
+      window.pywebview.api.ocr_image(it.dataUrl).then((res) => {
+        if (res && res.text) collected.push((imgs.length > 1 ? `[图片${i + 1}]\n` : "") + res.text);
+        else if (res && res.error) appendSystem("OCR 失败：" + res.error);
+        done++;
+        if (done === imgs.length) {
+          btn.disabled = false;
+          btn.textContent = old;
+          const text = collected.join("\n\n").trim();
+          if (!text) { appendSystem("未在图片中识别到文字"); return; }
+          const prefix = inputEl.value.trim() ? "\n\n" : "";
+          inputEl.value += prefix + "[图片OCR识别结果]\n" + text;
+          autoResize();
+          inputEl.focus();
+        }
+      }).catch((e) => {
+        done++;
+        appendSystem("OCR 调用失败：" + e);
+        if (done === imgs.length) { btn.disabled = false; btn.textContent = old; }
+      });
     });
   }
 
   $("btnImg").onclick = () => fileImgEl.click();
   fileImgEl.onchange = () => {
-    if (fileImgEl.files && fileImgEl.files[0]) handleImageFile(fileImgEl.files[0]);
+    if (fileImgEl.files) {
+      for (const f of fileImgEl.files) handleImageFile(f);
+    }
     fileImgEl.value = "";
   };
   $("btnImgCancel").onclick = clearImgPreview;
   $("btnOcr").onclick = () => { runOcr(); };
 
-  // 粘贴图片
+  // 粘贴图片（支持一次粘贴多张）
   document.addEventListener("paste", (e) => {
     if (!e.clipboardData || !e.clipboardData.items) return;
     const items = e.clipboardData.items;
+    let added = false;
     for (let i = 0; i < items.length; i++) {
       if (items[i].type && items[i].type.indexOf("image/") === 0) {
         const file = items[i].getAsFile();
         if (file) {
           e.preventDefault();
           handleImageFile(file);
-          return;
+          added = true;
         }
       }
     }
+    if (added) return;
   });
 
-  // 拖拽图片到输入区
+  // 拖拽图片到输入区（支持多文件）
   const composer = document.querySelector(".composer");
   composer.addEventListener("dragover", (e) => {
     e.preventDefault();
@@ -665,7 +991,7 @@
     e.preventDefault();
     const files = e.dataTransfer && e.dataTransfer.files;
     if (files && files.length) {
-      handleImageFile(files[0]);
+      for (const f of files) handleImageFile(f);
     }
   });
 
@@ -694,6 +1020,10 @@
       cwdEl.textContent = "📁 " + cwd;
     });
   };
+  // 右下角 cwd 路径也可点击切换目录
+  cwdEl.style.cursor = "pointer";
+  cwdEl.title = "点击切换工作目录";
+  cwdEl.onclick = $("btnDir").onclick;
 
   function newTask() {
     const name = window.prompt("任务名称（可留空，自动命名）：", "");
@@ -771,10 +1101,24 @@
     highlightActive();
   };
 
-  // ---------------- 启动 ----------------
+  // ---------------- 启动（兼容 pywebviewready 时序坑 + API 方法异步注册） ----------------
   initTheme();
-  window.addEventListener("pywebviewready", function () {
-    window.pywebview.api.init().then(applyState);
-    inputEl.focus();
-  });
+  function _bootstrap() {
+    window._bsCount = (window._bsCount || 0) + 1;
+    if (window._bsCount > 40) {
+      appendSystem("pywebview API 2 秒内未就绪，请重启应用或联系作者");
+      return;
+    }
+    var api = window.pywebview && window.pywebview.api;
+    if (!api || typeof api.init !== "function") {
+      setTimeout(_bootstrap, 50);
+      return;
+    }
+    api.init()
+      .then(applyState)
+      .catch(function () { setTimeout(_bootstrap, 100); });
+    try { inputEl && inputEl.focus(); } catch (e) {}
+  }
+  window.addEventListener("pywebviewready", _bootstrap);
+  _bootstrap();
 })();
