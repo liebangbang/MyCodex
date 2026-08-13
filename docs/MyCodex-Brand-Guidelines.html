@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MyCodex 品牌识别规范</title>
+<style>
+:root {
+  --violet: #6C5CE7;
+  --violet-deep: #574BCD;
+  --magenta: #BA25AE;
+  --dark: #1B1830;
+  --gray: #6B6885;
+  --line: #ECEAF6;
+  --bg: #FBFAFF;
+  --radius-xl: 28%;
+  --radius: 16px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--dark);
+  background: #fff;
+  line-height: 1.7;
+  padding: 60px 0;
+}
+.page { max-width: 860px; margin: 0 auto; padding: 0 36px; }
+h1 { font-size: 36px; letter-spacing: -.02em; margin-bottom: 8px; }
+.sub { color: var(--gray); font-size: 16px; margin-bottom: 38px; }
+h2 { font-size: 22px; margin: 44px 0 16px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+h3 { font-size: 16px; margin: 26px 0 10px; color: var(--violet-deep); }
+p { margin-bottom: 12px; color: var(--dark); }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin: 20px 0; }
+.card {
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 24px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.card img { width: 120px; height: 120px; }
+.card .label { font-size: 13px; color: var(--gray); }
+.bg-dark { background: #1B1830; }
+.color-swatch {
+  display: flex; align-items: center; gap: 14px; margin: 10px 0;
+}
+.swatch { width: 56px; height: 56px; border-radius: 12px; box-shadow: inset 0 0 0 1px rgba(0,0,0,.08); }
+.swatch.violet { background: var(--violet); }
+.swatch.magenta { background: var(--magenta); }
+.swatch.dark { background: var(--dark); }
+.swatch.white { background: #fff; border: 1px solid var(--line); }
+.code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; color: var(--gray); }
+table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 14px; }
+th { color: var(--gray); font-weight: 600; }
+.dont { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 18px 0; }
+.dont-item { text-align: center; }
+.dont-item img { width: 80px; height: 80px; border-radius: 16px; }
+.dont-item .cap { font-size: 12px; color: #C0392B; margin-top: 8px; }
+.note {
+  background: #F1EEFF; border-left: 4px solid var(--violet); padding: 14px 18px;
+  border-radius: 0 12px 12px 0; font-size: 14px; margin: 20px 0;
+}
+@media print {
+  body { padding: 0; }
+  .page { max-width: 100%; }
+  h2 { page-break-after: avoid; }
+  .card { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>MyCodex 品牌识别规范</h1>
+  <p class="sub">版本 1.0 · 2026-08-13 · 用于商标申请、官网、宣传物料</p>
+
+  <h2>1. Logo 图形</h2>
+  <p>MyCodex 图形标识由圆角方形背景与倾斜的「&lt;/&gt;」代码符号组成，象征代码、连接与 AI 助手。</p>
+  <div class="grid-2">
+    <div class="card">
+      <img src="../site/logo-512.png" alt="MyCodex 彩色 logo" />
+      <div>
+        <div class="label">彩色稿（主用）</div>
+        <div class="code">logo-512.png / 1024×1024 源文件</div>
+      </div>
+    </div>
+    <div class="card">
+      <img src="../site/logo-black-512.png" alt="MyCodex 黑白稿" />
+      <div>
+        <div class="label">黑白稿（商标申请）</div>
+        <div class="code">logo-black-512.png</div>
+      </div>
+    </div>
+    <div class="card bg-dark">
+      <img src="../site/logo-white-512.png" alt="MyCodex 反白稿" />
+      <div style="color:#fff">
+        <div class="label">反白稿（深色背景）</div>
+        <div class="code">logo-white-512.png</div>
+      </div>
+    </div>
+    <div class="card">
+      <div style="display:flex;align-items:center;gap:14px">
+        <img src="../site/logo-64.png" alt="64px" style="width:64px;height:64px" />
+        <img src="../site/logo-32.png" alt="32px" style="width:32px;height:32px" />
+      </div>
+      <div>
+        <div class="label">应用尺寸示例</div>
+        <div class="code">logo-32 / 64 / 128 / 256 / 512</div>
+      </div>
+    </div>
+  </div>
+
+  <h2>2. 标准色</h2>
+  <div class="color-swatch">
+    <div class="swatch violet"></div>
+    <div>
+      <div><strong>紫罗兰 Violet</strong></div>
+      <div class="code">HEX #6C5CE7 · RGB 108, 92, 231</div>
+    </div>
+  </div>
+  <div class="color-swatch">
+    <div class="swatch magenta"></div>
+    <div>
+      <div><strong>品红 Magenta</strong></div>
+      <div class="code">HEX #BA25AE · RGB 186, 37, 174</div>
+    </div>
+  </div>
+  <div class="color-swatch">
+    <div class="swatch dark"></div>
+    <div>
+      <div><strong>深色 Ink</strong></div>
+      <div class="code">HEX #1B1830 · RGB 27, 24, 48</div>
+    </div>
+  </div>
+  <div class="color-swatch">
+    <div class="swatch white"></div>
+    <div>
+      <div><strong>白色 White</strong></div>
+      <div class="code">HEX #FFFFFF · 用于图标与反白稿</div>
+    </div>
+  </div>
+
+  <h2>3. 安全区与最小尺寸</h2>
+  <table>
+    <tr><th>场景</th><th>最小尺寸</th><th>说明</th></tr>
+    <tr><td>桌面应用图标</td><td>512×512 px</td><td>macOS App 图标</td></tr>
+    <tr><td>网站导航</td><td>44×44 px</td><td>配合 20px 品牌字使用</td></tr>
+    <tr><td>Favicon</td><td>32×32 px</td><td>16×16 / 32×32 / 64×64 多尺寸 ICO</td></tr>
+    <tr><td>商标申请图样</td><td>≥5×5 cm</td><td>建议使用黑白稿，300 dpi 打印</td></tr>
+  </table>
+  <div class="note">
+    <strong>安全区：</strong>以 logo 高度为 X，四周至少保留 0.25X 的留白。任何文字、边框或其他元素不得侵入安全区。
+  </div>
+
+  <h2>4. 商标申请建议</h2>
+  <h3>4.1 申请要素</h3>
+  <ul>
+    <li><strong>文字商标：</strong>MyCodex（建议同步注册）</li>
+    <li><strong>图形商标：</strong>圆角方块 + &lt;/&gt; 图标（使用本规范黑白稿）</li>
+  </ul>
+  <h3>4.2 推荐类别</h3>
+  <table>
+    <tr><th>类别</th><th>核心项目</th></tr>
+    <tr><td>第 9 类</td><td>计算机软件、可下载应用软件、AI 程序</td></tr>
+    <tr><td>第 42 类</td><td>计算机软件设计、开发、技术服务、SaaS</td></tr>
+    <tr><td>第 35 类</td><td>广告、商业管理（可选）</td></tr>
+  </table>
+  <h3>4.3 提交图样要求</h3>
+  <p>向中国国家知识产权局提交时，图形商标图样应为 JPG 格式，清晰、方向正确，长宽不大于 10×10 cm，不小于 5×5 cm。建议优先使用「黑白稿」，获准后使用时颜色不受限。</p>
+
+  <h2>5. 错误使用示例</h2>
+  <div class="dont">
+    <div class="dont-item">
+      <div style="width:80px;height:80px;background:#f0f;display:flex;align-items:center;justify-content:center;margin:0 auto;border-radius:16px"><img src="../site/logo-512.png" style="width:70px;height:70px" /></div>
+      <div class="cap">改变背景色</div>
+    </div>
+    <div class="dont-item">
+      <div style="width:80px;height:80px;display:flex;align-items:center;justify-content:center;margin:0 auto"><img src="../site/logo-512.png" style="width:80px;height:80px;transform:scaleX(-1)" /></div>
+      <div class="cap">水平翻转</div>
+    </div>
+    <div class="dont-item">
+      <div style="width:80px;height:80px;display:flex;align-items:center;justify-content:center;margin:0 auto"><img src="../site/logo-512.png" style="width:80px;height:60px" /></div>
+      <div class="cap">拉伸变形</div>
+    </div>
+    <div class="dont-item">
+      <div style="width:80px;height:80px;display:flex;align-items:center;justify-content:center;margin:0 auto"><img src="../site/logo-512.png" style="width:80px;height:80px;opacity:.4" /></div>
+      <div class="cap">降低对比度</div>
+    </div>
+  </div>
+
+  <h2>6. 文件清单</h2>
+  <table>
+    <tr><th>文件名</th><th>用途</th></tr>
+    <tr><td>MyCodex-logo.png</td><td>彩色源文件（1024×1024）</td></tr>
+    <tr><td>logo-black-512.png</td><td>黑白稿 / 商标申请</td></tr>
+    <tr><td>logo-white-512.png</td><td>反白稿 / 深色背景</td></tr>
+    <tr><td>logo-32/64/128/256/512.png</td><td>官网与 App 各尺寸</td></tr>
+    <tr><td>favicon.ico</td><td>浏览器标签图标</td></tr>
+    <tr><td>apple-touch-icon.png</td><td>iOS 书签 / 桌面图标</td></tr>
+  </table>
+
+  <div class="note">
+    <strong>提示：</strong>本规范仅供参考，商标注册涉及法律程序，建议委托专业商标代理机构办理，并以中国国家知识产权局最新要求为准。
+  </div>
+</div>
+</body>
+</html>

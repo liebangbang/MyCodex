@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MyCodex · 本地优先的 AI 桌面工作台</title>
+<meta name="description" content="MyCodex 是一款本地优先的 AI 桌面工作台：多模型随心切换、看得懂图片、管得了项目、产物即时预览，数据留在你自己的电脑上。" />
+<link rel="icon" href="favicon.ico" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ===== Nav ===== -->
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">
+      <img class="logo" src="logo-512.png" alt="MyCodex" width="44" height="44" /> MyCodex
+    </a>
+    <nav class="nav-links">
+      <a href="#features">核心能力</a>
+      <a href="#why">为什么本地</a>
+      <a href="#roadmap">路线图</a>
+      <a href="#faq">常见问题</a>
+    </nav>
+    <div class="nav-cta">
+      <a class="btn btn-ghost" href="#download">获取</a>
+      <a class="btn btn-primary" href="#download">下载 macOS</a>
+    </div>
+  </div>
+</header>
+
+<!-- ===== Hero ===== -->
+<section class="hero" id="top">
+  <div class="wrap hero-grid">
+    <div>
+      <span class="eyebrow">本地优先 · 隐私强 · 完全可改</span>
+      <h1>你的 AI 助手，<br><span class="grad">留在你自己的电脑上</span></h1>
+      <p class="lead">MyCodex 是一款本地优先的 AI 桌面工作台。多模型随心切换、看得懂图片、管得了项目、产物即时预览——敏感文件与对话不出本机，代码完全开源，按你的习惯持续打磨。</p>
+      <div class="hero-cta">
+        <a class="btn btn-primary btn-lg" href="#download">免费下载</a>
+        <a class="btn btn-ghost btn-lg" href="#features">看看能做什么</a>
+      </div>
+      <div class="trust">
+        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l4 4L19 7"/></svg> macOS 原生桌面应用</span>
+        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l4 4L19 7"/></svg> 数据本地加密存储</span>
+        <span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l4 4L19 7"/></svg> 开源，可自由定制</span>
+      </div>
+    </div>
+
+    <!-- Mock UI -->
+    <div class="mock" aria-hidden="true">
+      <div class="mock-bar"><i></i><i></i><i></i></div>
+      <div class="mock-body">
+        <div class="mock-side">
+          <div class="s-item active">产品方案</div>
+          <div class="s-item">代码重构</div>
+          <div class="s-item">周报整理</div>
+          <div class="s-item">设计 Review</div>
+        </div>
+        <div class="mock-chat">
+          <div class="bubble me">帮我分析这份需求文档</div>
+          <div class="bubble ai">已梳理 PRD，提取出 3 个核心功能点与验收标准…</div>
+          <div class="mock-tool">⚙ 工具 · <b>读取文件</b> PRD_v2.pdf<span class="mock-tag">成功</span></div>
+          <div class="bubble ai">生成任务清单与风险点，已存为产物 →</div>
+          <div class="bubble me">再看看这张流程图</div>
+          <div class="mock-tool">👁 视觉 · <b>理解图片</b> flow.png<span class="mock-tag">已识别</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== Stats ===== -->
+<section style="padding-top:0">
+  <div class="wrap stats">
+    <div class="stat"><div class="n">100%</div><div class="l">本地运行，敏感数据不出本机</div></div>
+    <div class="stat"><div class="n">2+</div><div class="l">主流模型家族随心切换</div></div>
+    <div class="stat"><div class="n">∞</div><div class="l">任务数量，关了再开能续上</div></div>
+    <div class="stat"><div class="n">0</div><div class="l">源码闭源，代码完全在你手里</div></div>
+  </div>
+</section>
+
+<!-- ===== Features ===== -->
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="eyebrow">核心能力</span>
+      <h2>一个客户端，干完 AI 该干的活</h2>
+      <p class="h-sub">不是又一个网页聊天框。MyCodex 把对话、视觉、工具、文件管理收进同一个桌面窗口。</p>
+    </div>
+    <div class="features">
+      <div class="feature">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/></svg></div>
+        <h3>多模型路由</h3>
+        <p>按任务选模型：文字活儿用便宜的 DeepSeek，看图用通义千问视觉模型。你只管选，端点自动切换。</p>
+      </div>
+      <div class="feature">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="M21 15l-5-5L5 21"/></svg></div>
+        <h3>视觉理解</h3>
+        <p>多图上传即识别，简历截图、海报、官网截图直接丢进去就能分析；无视觉模型时本地 OCR 兜底。</p>
+      </div>
+      <div class="feature">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+        <h3>多任务管理</h3>
+        <p>新建、切换、搜索、折叠任务列表；关掉再打开自动恢复到上次进度，长项目不断档。</p>
+      </div>
+      <div class="feature">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></div>
+        <h3>产物即时预览</h3>
+        <p>右侧直接渲染生成的网页、Markdown、文本；链接可点开。HTML 自动内联资源，所见即所得。</p>
+      </div>
+      <div class="feature">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17l6-6-6-6M12 19h8"/></svg></div>
+        <h3>本地工具执行</h3>
+        <p>读本地文件、跑命令、产出文件，全程在桌面内完成。危险操作二次确认，防误删误改。</p>
+      </div>
+      <div class="feature">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/></svg></div>
+        <h3>隐私优先</h3>
+        <p>配置与对话留在本地，密钥文件权限锁到 600；不上传裸数据，合规风险低。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== Why local ===== -->
+<section id="why" style="background:linear-gradient(180deg,#fff, #F6F4FF);">
+  <div class="wrap why">
+    <div>
+      <span class="eyebrow">为什么本地优先</span>
+      <h2>把 AI 装进自己的电脑，<br>而不是别人的服务器</h2>
+      <ul style="margin-top:24px">
+        <li><span class="chk">✓</span><div><b>敏感资料不外传</b><span>简历、JD、合同、薪酬——这些本就不该进第三方服务器的数据，全程在本机处理。</span></div></li>
+        <li><span class="chk">✓</span><div><b>断网也能续上</b><span>任务自动存档，关掉再开回到原处；不依赖某个网页是否还活着。</span></div></li>
+        <li><span class="chk">✓</span><div><b>工具真能干活</b><span>不只是"聊"，能读文件、跑命令、出产物，像本地 IDE 一样顺手。</span></div></li>
+        <li><span class="chk">✓</span><div><b>代码是你的</b><span>开源在 GitHub，从外观到能力都能按自己的需求改，不是被平台框死的黑盒。</span></div></li>
+      </ul>
+    </div>
+    <div class="why-card">
+      <h4>网页聊天 vs 本地工作台</h4>
+      <table class="compare">
+        <thead><tr><th>能力</th><th>网页 AI</th><th>MyCodex</th></tr></thead>
+        <tbody>
+          <tr><td>数据留本地</td><td class="no">✕</td><td class="yes">✓</td></tr>
+          <tr><td>读本地文件 / 跑命令</td><td class="no">✕</td><td class="yes">✓</td></tr>
+          <tr><td>任务关了能续</td><td class="no">✕</td><td class="yes">✓</td></tr>
+          <tr><td>多模型按需切</td><td class="no">✕</td><td class="yes">✓</td></tr>
+          <tr><td>开源可定制</td><td class="no">✕</td><td class="yes">✓</td></tr>
+          <tr><td>零配置即用</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ===== Roadmap ===== -->
+<section id="roadmap">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="eyebrow">产品路线图</span>
+      <h2>已经能用好用，还在变更好</h2>
+      <p class="h-sub">当前版本已覆盖对话、视觉、工具、预览与任务恢复；下一阶段聚焦易用性与个性化。</p>
+    </div>
+    <div class="timeline">
+      <div class="phase">
+        <div class="tag">现在 · V1.x</div>
+        <h3>稳定打磨</h3>
+        <ul>
+          <li class="done">多模型路由 + 视觉理解</li>
+          <li class="done">多任务管理 + 自动恢复</li>
+          <li class="done">产物预览（网页可渲染）</li>
+          <li class="done">本地工具执行 + 危险确认</li>
+          <li class="done">长任务续写 + 会话体积保护</li>
+        </ul>
+      </div>
+      <div class="phase">
+        <div class="tag">重点 · V2.0</div>
+        <h3>易用性 + 个性化</h3>
+        <ul>
+          <li>首次启动引导（3 步上手）</li>
+          <li>命令面板 ⌘K 发现所有能力</li>
+          <li>设置中心（模型/密钥/主题一处配）</li>
+          <li>个人资料：让 AI 长期记得你</li>
+          <li>拖拽 / 粘贴即传、批量图</li>
+        </ul>
+      </div>
+      <div class="phase">
+        <div class="tag">愿景 · V3.0</div>
+        <h3>生态与扩展</h3>
+        <ul>
+          <li>可插拔集成（第三方变插件）</li>
+          <li>模板市场（共享提示词）</li>
+          <li>跨设备加密同步</li>
+          <li>团队空间（共享模板/知识）</li>
+          <li>工作流 / 定时自动化</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== Download ===== -->
+<section id="download">
+  <div class="wrap">
+    <div class="download">
+      <h2>把 MyCodex 装进你的 Mac</h2>
+      <p>免费、开源、本地优先。敏感数据始终留在你自己的电脑上。</p>
+      <div class="hero-cta" style="justify-content:center">
+        <a class="btn btn-primary btn-lg" href="download/MyCodex-macOS.zip" download>⬇ 下载 for macOS</a>
+        <a class="btn btn-ghost btn-lg" href="https://github.com/liebangbang/MyCodex" target="_blank" rel="noopener">在 GitHub 查看源码</a>
+      </div>
+      <div class="dl-badges">
+        <span style="font-size:13px;color:rgba(255,255,255,.8)">macOS 12+ · Apple Silicon / Intel · 约 465 KB（当前为源码运行版，需 Python 3.13+ 环境）</span>
+      </div>
+      <p style="margin-top:18px;font-size:13px;color:rgba(255,255,255,.7);max-width:560px;margin-left:auto;margin-right:auto;line-height:1.7">
+        当前分发包包含 MyCodex.app 与源码，运行需要本地 Python 3.13+ 及 pywebview 等依赖（详见 GitHub README）。
+        独立安装包（.dmg，双击即用）正在构建中。
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ===== FAQ ===== -->
+<section id="faq" style="background:#fff">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="eyebrow">常见问题</span>
+      <h2>你可能想问</h2>
+    </div>
+    <div class="faq">
+      <div class="faq-item">
+        <h3>我的聊天记录和文件安全吗？</h3>
+        <p>全部存在你本机的 <code>~/.config/mycode/</code> 目录，密钥文件权限锁到 chmod 600，不会上传到任何服务器。</p>
+      </div>
+      <div class="faq-item">
+        <h3>需要自己申请模型 API Key 吗？</h3>
+        <p>是的。MyCodex 本身不卖模型，你用自己的 DeepSeek / 通义千问等 Key，成本完全透明、可控。</p>
+      </div>
+      <div class="faq-item">
+        <h3>支持 Windows 或手机吗？</h3>
+        <p>当前为 macOS 原生应用。Windows / 移动端在路线图中，待 macOS 体验夯实后再扩展。</p>
+      </div>
+      <div class="faq-item">
+        <h3>能接我自己的业务系统吗？</h3>
+        <p>可以。代码完全开源，后续规划的可插拔集成框架让你以插件形式接入第三方 API，而非改源码。</p>
+      </div>
+      <div class="faq-item">
+        <h3>收费吗？</h3>
+        <p>MyCodex 本身免费且开源，你只需承担所用大模型 API 的调用费用。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== Footer ===== -->
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <div>
+      <a class="brand" href="#top"><img class="logo" src="logo-512.png" alt="MyCodex" width="44" height="44" /> MyCodex</a>
+      <small>本地优先的 AI 桌面工作台 · 数据留在你自己的电脑上</small>
+    </div>
+    <nav class="foot-links">
+      <a href="#features">核心能力</a>
+      <a href="#roadmap">路线图</a>
+      <a href="#faq">常见问题</a>
+      <a href="https://github.com/liebangbang/MyCodex" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+  <div class="wrap"><small>© 2026 MyCodex · 由 mycodex.me 提供 · 保留所有权利</small></div>
+</footer>
+
+</body>
+</html>
