@@ -9,10 +9,18 @@
   const previewEl = $("preview");
   const inputEl = $("input");
   const statusEl = $("statusText");
-  const cwdEl = $("cwdText");
+  const dirBtn = $("btnDir");
   const modelSel = $("modelSel");
   const thinkSel = $("thinkSel");
   const artCountEl = $("artCount");
+
+  // 折叠 / 搜索相关元素
+  const tasksEl = $("tasks");
+  const artifactsEl = $("artifacts");
+  const bodyEl = document.querySelector(".body");
+  const taskSearchEl = $("taskSearch");
+  const taskSearchClearEl = $("taskSearchClear");
+  let taskSearchQuery = "";
 
   // ---------------- 主题（亮/暗，跟随系统 + 手动切换 + 记忆） ----------------
   const themeKey = "mycodex_theme"; // "light" | "dark" | "auto"
@@ -53,6 +61,9 @@
   let currentToolCard = null;
   let busy = false;
   let activeTask = null;
+  // 后台生成：发送时所在任务；若生成中切换了任务，流式输出静默（不显示到新任务界面）
+  let generatingTask = null;
+  let streamHidden = false;
 
   function esc(s) {
     return String(s == null ? "" : s)
@@ -199,6 +210,14 @@
 
   function beginAssistant() {
     finalizeAssistant();
+    // 若已切到其他任务，生成中的输出静默（写盘仍归发送时任务）
+    if (generatingTask && generatingTask !== activeTask) {
+      streamHidden = true;
+      currentAssistantEl = null;
+      currentAssistantRaw = "";
+      return;
+    }
+    streamHidden = false;
     const m = document.createElement("div");
     m.className = "msg assistant";
     const label = document.createElement("div");
@@ -215,6 +234,10 @@
   }
 
   function appendAssistant(t) {
+    if (streamHidden) {
+      currentAssistantRaw += t;
+      return;
+    }
     if (!currentAssistantEl) beginAssistant();
     currentAssistantRaw += t;
     const b = currentAssistantEl.querySelector(".bubble");
@@ -262,6 +285,7 @@
 
   function appendTool(name, summary) {
     finalizeAssistant();
+    if (streamHidden) { currentToolCard = null; return; }
     const card = document.createElement("div");
     card.className = "tool-card";
     const args = smartToolArgs(name, summary);
@@ -287,7 +311,9 @@
   }
 
   function appendToolResult(name, summary, result) {
+    if (streamHidden) return;
     const card = currentToolCard || (function () { appendTool(name, summary); return currentToolCard; })();
+    if (!card) return;
     // 状态徽章：结果第一行，超长截断；完整结果存在 title 悬停可见
     const first = String(result || "").split("\n")[0].slice(0, 56);
     const st = card.querySelector(".tool-status");
@@ -444,8 +470,8 @@
   }
 
   function renderPreview(a) {
-    // 新文件预览：HTML 走源码、MD 走渲染（更安全稳定）
-    if (a.kind === "html") _previewView = "source";
+    // HTML 默认渲染；后端若判定为 MyCodex 自身 HTML，则强制源码防递归
+    if (a.kind === "html") _previewView = (a.force_source || isSelfRefHtml(a)) ? "source" : "rendered";
     else if (a.kind === "md") _previewView = "rendered";
     _previewing = a;
     const selfRef = isSelfRefHtml(a);
@@ -610,7 +636,83 @@
       if (!rendered.has(s.name)) taskListEl.appendChild(makeTaskItem(s, 0));
     });
     highlightActive();
+    applyTaskFilter();
   }
+
+  // 任务搜索：按名称实时过滤（不区分大小写）
+  function applyTaskFilter() {
+    const q = (taskSearchQuery || "").trim().toLowerCase();
+    let visible = 0;
+    taskListEl.querySelectorAll(".task-item").forEach((it) => {
+      const name = (it.dataset.name || "").toLowerCase();
+      const hit = !q || name.indexOf(q) > -1;
+      it.style.display = hit ? "" : "none";
+      if (hit) visible++;
+    });
+    let emptyEl = $("taskEmpty");
+    if (!emptyEl) {
+      emptyEl = document.createElement("div");
+      emptyEl.id = "taskEmpty";
+      emptyEl.className = "task-empty";
+      emptyEl.textContent = "无匹配任务";
+      taskListEl.appendChild(emptyEl);
+    }
+    emptyEl.style.display = (q && visible === 0) ? "" : "none";
+  }
+
+  // ---------------- 栏折叠 / 展开 ----------------
+  const COLLAPSE_KEY = "mycodex_collapsed"; // "tasks" | "artifacts" | "both"
+  function loadCollapsed() {
+    try { return localStorage.getItem(COLLAPSE_KEY) || ""; } catch (e) { return ""; }
+  }
+  function saveCollapsed(v) {
+    try { localStorage.setItem(COLLAPSE_KEY, v); } catch (e) {}
+  }
+  function setTasksCollapsed(c) {
+    tasksEl.classList.toggle("collapsed", c);
+    bodyEl.classList.toggle("tasks-collapsed", c);
+    if (!c) applyTaskFilter(); // 展开后重放搜索过滤
+  }
+  function setArtifactsCollapsed(c) {
+    artifactsEl.classList.toggle("collapsed", c);
+    bodyEl.classList.toggle("artifacts-collapsed", c);
+  }
+  function applyCollapsedFromStorage() {
+    const v = loadCollapsed();
+    setTasksCollapsed(v === "tasks" || v === "both");
+    setArtifactsCollapsed(v === "artifacts" || v === "both");
+  }
+
+  if ($("btnCollapseTasks")) $("btnCollapseTasks").onclick = () => {
+    setTasksCollapsed(true);
+    saveCollapsed(artifactsEl.classList.contains("collapsed") ? "both" : "tasks");
+  };
+  if ($("btnExpandTasks")) $("btnExpandTasks").onclick = () => {
+    setTasksCollapsed(false);
+    saveCollapsed(artifactsEl.classList.contains("collapsed") ? "artifacts" : "");
+  };
+  if ($("btnCollapseArtifacts")) $("btnCollapseArtifacts").onclick = () => {
+    setArtifactsCollapsed(true);
+    saveCollapsed(tasksEl.classList.contains("collapsed") ? "both" : "artifacts");
+  };
+  if ($("btnExpandArtifacts")) $("btnExpandArtifacts").onclick = () => {
+    setArtifactsCollapsed(false);
+    saveCollapsed(tasksEl.classList.contains("collapsed") ? "tasks" : "");
+  };
+
+  // 任务搜索输入
+  if (taskSearchEl) taskSearchEl.addEventListener("input", (e) => {
+    taskSearchQuery = e.target.value;
+    taskSearchClearEl.style.display = taskSearchQuery ? "" : "none";
+    applyTaskFilter();
+  });
+  if (taskSearchClearEl) taskSearchClearEl.onclick = () => {
+    taskSearchQuery = "";
+    taskSearchEl.value = "";
+    taskSearchClearEl.style.display = "none";
+    applyTaskFilter();
+    taskSearchEl.focus();
+  };
 
   function makeTaskItem(s, depth) {
     const item = document.createElement("div");
@@ -697,6 +799,10 @@
   }
 
   function deleteTask(name) {
+    if (busy) {
+      appendSystem("任务正在生成中，请等本轮完成后（点「停止」或稍候）再删除任务");
+      return;
+    }
     // 统计直接子任务数量，删除时提示会级联删除
     const children = (window._sessionsCache || []).filter((s) => s.parent === name).length;
     const msg = children > 0
@@ -724,13 +830,23 @@
     window.pywebview.api.open_task(name).then((res) => {
       if (res.error) return;
       activeTask = name;
+      // 切回生成中的任务时恢复流式显示；切走则保持静默
+      streamHidden = !!(generatingTask && generatingTask !== name);
       clearMessages();
-      (res.transcript || []).forEach(playTranscript);
+      playTranscriptRange(res.transcript || [], res.transcript_total);
       renderArtifacts(res.artifacts || []);
       setHeader({ session_name: res.name, model: res.model, think_mode: res.think_mode, cwd_short: res.cwd_short });
       renderSessions(window._sessionsCache || []);
       highlightActive();
     });
+  }
+
+  // 回放历史：若历史被截断（仅返回最近 N 条），顶部提示，避免用户误以为对话丢失
+  function playTranscriptRange(entries, total) {
+    if (total > entries.length) {
+      appendSystem("对话历史较长，仅显示最近 " + entries.length + " 条（共 " + total + " 条）");
+    }
+    entries.forEach(playTranscript);
   }
 
   function playTranscript(entry) {
@@ -759,7 +875,6 @@
     currentAssistantRaw = "";
     currentToolCard = null;
   }
-
   // ---------------- 头部 / 状态 ----------------
   function setHeader(st) {
     if (st.session_name) {
@@ -772,7 +887,7 @@
     }
     if (st.model) modelSel.value = st.model;
     if (st.think_mode) thinkSel.value = st.think_mode;
-    cwdEl.textContent = st.cwd_short ? "📁 " + st.cwd_short : "";
+    if (dirBtn) dirBtn.title = st.cwd_short ? "工作目录：" + st.cwd_short + "（点击切换）" : "选择工作目录";
   }
 
   function setBusy(b) {
@@ -790,11 +905,11 @@
     renderSessions(st.sessions || []);
     window._sessionsCache = st.sessions || [];
     renderArtifacts(st.artifacts || []);
-    // 启动时若已自动恢复上次任务，渲染其历史对话
+    // 启动时若已自动恢复上次任务，渲染其历史对话（截断展示，防卡顿）
     if (st.session_name && st.transcript && st.transcript.length && prevTask !== st.session_name) {
       activeTask = st.session_name;
       clearMessages();
-      st.transcript.forEach(playTranscript);
+      playTranscriptRange(st.transcript, st.transcript_total);
       renderArtifacts(st.artifacts || []);
       highlightActive();
     }
@@ -823,6 +938,9 @@
     inputEl.value = "";
     clearImgPreview();
     autoResize();
+    // 记录本次生成所属任务：生成中可自由切换查看，流式输出会自动静默，不串台
+    generatingTask = activeTask;
+    streamHidden = false;
     setBusy(true);
     window.pywebview.api.send(text, images).then(() => {
       window.pywebview.api.init().then((st) => { applyState(st); highlightActive(); });
@@ -1014,16 +1132,16 @@
   modelSel.onchange = () => { if (apiReady()) window.pywebview.api.set_model(modelSel.value); };
   thinkSel.onchange = () => { if (apiReady()) window.pywebview.api.set_think_mode(thinkSel.value); };
 
-  $("btnDir").onclick = () => {
-    if (!apiReady()) return;
-    window.pywebview.api.choose_dir().then((cwd) => {
-      cwdEl.textContent = "📁 " + cwd;
-    });
-  };
-  // 右下角 cwd 路径也可点击切换目录
-  cwdEl.style.cursor = "pointer";
-  cwdEl.title = "点击切换工作目录";
-  cwdEl.onclick = $("btnDir").onclick;
+  // 顶栏"目录"按钮：点击切换工作目录，当前目录显示在 tooltip
+  if (dirBtn) {
+    dirBtn.style.cursor = "pointer";
+    dirBtn.onclick = () => {
+      if (!apiReady()) return;
+      window.pywebview.api.choose_dir().then((cwd) => {
+        dirBtn.title = "工作目录：" + cwd + "（点击切换）";
+      });
+    };
+  }
 
   function newTask() {
     const name = window.prompt("任务名称（可留空，自动命名）：", "");
@@ -1099,10 +1217,17 @@
   window.afterSend = function () {
     refreshSessions();
     highlightActive();
+    // 生成完成：若期间切走了，提示后台完成；重置生成上下文
+    const doneInBg = generatingTask && generatingTask !== activeTask;
+    const bgTask = generatingTask;
+    generatingTask = null;
+    streamHidden = false;
+    if (doneInBg) appendSystem("后台任务「" + bgTask + "」已完成，可切换过去查看");
   };
 
   // ---------------- 启动（兼容 pywebviewready 时序坑 + API 方法异步注册） ----------------
   initTheme();
+  applyCollapsedFromStorage();
   function _bootstrap() {
     window._bsCount = (window._bsCount || 0) + 1;
     if (window._bsCount > 40) {

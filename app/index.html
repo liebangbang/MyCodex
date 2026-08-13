@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>MyCodex</title>
-  <link rel="stylesheet" href="style.css?v=3" />
+  <link rel="stylesheet" href="style.css?v=4" />
 </head>
 <body>
   <div class="app">
@@ -38,11 +38,25 @@
       <aside class="tasks" id="tasks">
         <div class="pane-head">
           <span>任务</span>
-          <button class="icon-btn" id="btnAddTask" title="新建任务">
-            <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
-          </button>
+          <div class="pane-actions">
+            <button class="icon-btn" id="btnCollapseTasks" title="折叠任务栏">
+              <svg class="icon" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>
+            </button>
+            <button class="icon-btn" id="btnAddTask" title="新建任务">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="task-search">
+          <svg class="icon search-ico" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          <input id="taskSearch" class="search-input" type="text" placeholder="搜索任务…" />
+          <button class="search-clear" id="taskSearchClear" title="清空" style="display:none">×</button>
         </div>
         <div class="task-list" id="taskList"></div>
+        <button class="rail-expand" id="btnExpandTasks" title="展开任务栏">
+          <svg class="icon" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+          <span class="rail-label">任务</span>
+        </button>
       </aside>
 
       <div class="splitter" id="splitLeft" title="拖拽调整宽度"></div>
@@ -75,7 +89,6 @@
           <div class="composer-input">
             <textarea id="input" rows="1" placeholder="输入任务指令…  (Enter 换行 · ⌘/Ctrl+Enter 发送 · 可粘贴/拖拽图片)"></textarea>
             <div class="composer-btns">
-              <span class="cwd" id="cwdText" title="工作目录"></span>
               <button class="btn stop" id="btnStop" style="display:none">停止</button>
               <button class="btn primary" id="btnSend" title="发送 (⌘/Ctrl+Enter)">发送</button>
             </div>
@@ -98,7 +111,12 @@
       <aside class="artifacts" id="artifacts">
         <div class="pane-head">
           <span>产物</span>
-          <span class="count" id="artCount">0</span>
+          <div class="pane-actions">
+            <span class="count" id="artCount">0</span>
+            <button class="icon-btn" id="btnCollapseArtifacts" title="折叠产物栏">
+              <svg class="icon" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+            </button>
+          </div>
         </div>
         <div class="preview" id="preview">
           <div class="preview-empty">
@@ -107,6 +125,10 @@
           </div>
         </div>
         <div class="art-list" id="artList"></div>
+        <button class="rail-expand" id="btnExpandArtifacts" title="展开产物栏">
+          <svg class="icon" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>
+          <span class="rail-label">产物</span>
+        </button>
       </aside>
     </div>
   </div>
@@ -123,6 +145,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=3"></script>
+  <script src="app.js?v=4"></script>
 </body>
 </html>

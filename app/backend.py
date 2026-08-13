@@ -14,6 +14,7 @@ import time
 import threading
 from pathlib import Path
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 import webview
 
@@ -65,8 +66,18 @@ MAX_REPEAT = 3  # 连续相同工具调用超过此值视为死循环，自动�
 # 注：对话轮数已设为不限（_agent_loop 用 while True），靠 MAX_REPEAT 防死循环；
 #     如仍需硬性轮数上限，可改回 `for _ in range(N)` 并定义 MAX_TURNS = N。
 MAX_TOKENS = 8192
+MAX_CONTINUE = 5           # 长任务输出超 max_tokens 时，自动续写的最大段数（防无限循环）
+TRANSCRIPT_HARD_LIMIT = 1_500_000  # 会话落盘硬上限（~1.5MB），超出丢弃最旧段，防文件膨胀卡死
 VISION_MAX_TOKENS = 4096   # 千问 VL 单次回复上限（比 DeepSeek 保守）
 VISION_MAX_PDF_PAGES = 5   # PDF 最多转 5 页发给视觉模型
+
+# 上下文管理：防止历史无限膨胀导致请求超时/中断
+CTX_HARD_LIMIT = 150        # 发给模型的 history 消息数硬上限（超出则压缩）
+CTX_SOFT_LIMIT = 400_000    # 发给模型的 history 总字符软上限（超出则压缩）
+CTX_KEEP_RECENT = 40        # 压缩时保留最近 N 条完整消息（含本轮 user）
+PLAYBACK_LIMIT = 80         # 启动/打开任务时，界面最多回放的历史消息条数（防卡顿）# 网络重试：连接建立阶段可重试（未开始流式输出时）；进入流式后不重试避免重复内容
+API_RETRY = 3               # 最大重试次数（指数退避 1/2/4s）
+API_RETRY_BASE_DELAY = 1.0
 
 COMPLEX_KEYWORDS = [
     "设计", "重构", "架构", "优化", "调试", "排错", "分析", "为什么", "原理", "比较",
@@ -458,41 +469,80 @@ def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_rea
             body["reasoning_effort"] = "high"
 
     data = json.dumps(body).encode("utf-8")
-    req = Request(
-        cc["base_url"].rstrip("/") + "/chat/completions",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {cc['api_key']}",
-            "Accept": "text/event-stream",
-        },
-        method="POST",
-    )
-
     content = []
     reasoning = []
     tc_acc = {}
+    finish_reason = None
 
-    with urlopen(req, timeout=600) as resp:
-        buf = ""
-        for raw in resp:
-            if not raw:
-                continue
-            buf += raw.decode("utf-8", errors="replace")
-            while "\n\n" in buf:
-                event, buf = buf.split("\n\n", 1)
-                for line in event.splitlines():
-                    line = line.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[len("data:"):].strip()
-                    if payload == "[DONE]":
-                        continue
-                    try:
-                        chunk = json.loads(payload)
-                    except Exception:
-                        continue
-                    _handle_chunk(chunk, content, reasoning, tc_acc, on_text, on_reason)
+    # 连接建立阶段可重试（HTTP 5xx / 网络错误 / 超时），进入流式读取后不再重试
+    last_err = None
+    for attempt in range(API_RETRY + 1):
+        if attempt > 0:
+            delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            time.sleep(delay)
+        req = Request(
+            cc["base_url"].rstrip("/") + "/chat/completions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {cc['api_key']}",
+                "Accept": "text/event-stream",
+            },
+            method="POST",
+        )
+        try:
+            resp = urlopen(req, timeout=600)
+            break
+        except HTTPError as e:
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")[:1200]
+            except Exception:
+                pass
+            last_err = f"HTTP {e.code}: {e.reason}"
+            if err_body:
+                last_err += f"\n服务器返回：{err_body}"
+            # 4xx 不重试（参数/鉴权问题），5xx 与网络错误重试
+            if 400 <= e.code < 500:
+                raise RuntimeError(last_err)
+            if attempt >= API_RETRY:
+                raise RuntimeError(last_err)
+        except (URLError, OSError, TimeoutError) as e:
+            last_err = str(getattr(e, "reason", e))
+            if attempt >= API_RETRY:
+                raise
+    else:
+        raise RuntimeError(f"API 连接失败（已重试 {API_RETRY} 次）：{last_err}")
+
+    try:
+        with resp:
+            buf = ""
+            for raw in resp:
+                if not raw:
+                    continue
+                buf += raw.decode("utf-8", errors="replace")
+                while "\n\n" in buf:
+                    event, buf = buf.split("\n\n", 1)
+                    for line in event.splitlines():
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[len("data:"):].strip()
+                        if payload == "[DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(payload)
+                        except Exception:
+                            continue
+                        _handle_chunk(chunk, content, reasoning, tc_acc, on_text, on_reason)
+                        fchoice = (chunk.get("choices") or [{}])[0]
+                        fr = fchoice.get("finish_reason")
+                        if fr:
+                            finish_reason = fr
+    except (URLError, OSError, TimeoutError, ConnectionError) as e:
+        # 进入流式后中途断流：保留已生成内容，标记 error 交由上层提示/续写，避免整段丢失
+        log("streaming interrupted: " + str(getattr(e, "reason", e)))
+        finish_reason = "error"
 
     tool_calls = []
     for idx in sorted(tc_acc.keys()):
@@ -507,7 +557,82 @@ def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_rea
             "type": tc.get("type", "function"),
             "function": {"name": tc.get("name"), "arguments": parsed},
         })
-    return "".join(content), "".join(reasoning), tool_calls
+    return "".join(content), "".join(reasoning), tool_calls, finish_reason
+
+
+def compact_history(history):
+    """上下文压缩：history 超过硬上限（条数或字符）时，把最旧的部分压缩为一条
+    摘要 system 消息，保留最近 CTX_KEEP_RECENT 条完整。纯本地、不额外调模型，
+    避免历史无限膨胀导致 API 请求超时/中断。返回 (新history, 是否压缩)。
+
+    注意：切分点必须落在合法的 assistant↔tool 配对边界，否则保留窗口第一条是
+    孤立 tool 消息（其 assistant(tool_calls) 已被裁掉）时，DeepSeek 会返回
+    HTTP 400 "Messages with role 'tool' must be a response to a preceding message
+    with 'tool_calls'"，导致长对话请求失败中断。"""
+    if not history:
+        return history, False
+    n = len(history)
+    size = sum(len(json.dumps(m, ensure_ascii=False)) for m in history)
+    if n <= CTX_HARD_LIMIT and size <= CTX_SOFT_LIMIT:
+        return history, False
+
+    # 保留最近 N 条，但窗口头部向前回退：跳过窗口开头的孤立 tool 消息，
+    # 直到落在 user / assistant 消息上，保证 assistant(tool_calls)→tool 配对完整。
+    start = max(0, n - CTX_KEEP_RECENT)
+    while start < n and history[start].get("role") == "tool":
+        start -= 1
+    if start < 0:
+        start = 0
+    old = history[:start]
+    recent = history[start:]
+
+    # 尾部防御：若窗口最后一条 assistant 带 tool_calls 却无对应 tool 响应
+    #（正常流程不会发生，但落盘裁剪等异常路径可能产生），裁掉避免 dangling tool_calls。
+    while recent and recent[-1].get("role") == "assistant" and recent[-1].get("tool_calls"):
+        recent.pop()
+    if not recent:  # 极端兜底：全被裁掉则保留最近一条
+        recent = history[-1:]
+
+    # 从被裁掉的部分提取早期 user 问题要点，作为一条摘要保留线索（不调模型，零失败）
+    hints = []
+    for m in old:
+        if m.get("role") == "user" and m.get("content"):
+            s = str(m["content"]).strip().replace("\n", " ")
+            if s:
+                hints.append(s[:80])
+    summary = "；".join(hints[-12:]) if hints else "（早期对话已省略）"
+    if len(summary) > 600:
+        summary = summary[:600] + "…"
+
+    new = [{"role": "system", "content": "[早期对话摘要] " + summary}] + recent
+    return new, True
+
+
+def sanitize_messages(messages):
+    """防御性清洗：删除无法配对的孤立 tool 消息，并去掉末尾悬空的
+    tool_calls（assistant 带 tool_calls 但缺 tool 响应）。长会话落盘裁剪
+    （pop(0)）也可能产生孤立 tool 消息，这里统一兜底，避免 DeepSeek 400。"""
+    if not messages:
+        return messages
+    out = []
+    pending = set()  # 尚未被 tool 响应消费的 tool_call_id
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            tid = m.get("tool_call_id")
+            if not tid or tid not in pending:
+                continue  # 孤立 tool 消息，丢弃
+            pending.discard(tid)
+            out.append(m)
+        else:
+            if role == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    if tc and tc.get("id"):
+                        pending.add(tc["id"])
+            out.append(m)
+    while out and out[-1].get("role") == "assistant" and out[-1].get("tool_calls"):
+        out.pop()
+    return out
 
 
 def _handle_chunk(chunk, content, reasoning, tc_acc, on_text, on_reason):
@@ -762,6 +887,7 @@ class Api:
         self.parent = None
         self._pending_images = []        # 待发送的图片/PDF data URL 列表
         self._pending_image_kind = None  # "vision" | "ocr"
+        self._ctx = None                 # agent 线程上下文（生成中非空；写盘固定到发送时的任务）
         self._stop = False
         self._asst_open = False
         self._asst_text = ""
@@ -791,7 +917,8 @@ class Api:
             "cwd_short": _short_cwd(self.cwd),
             "session_name": self.session_name,
             "artifacts": self.artifacts,
-            "transcript": self.transcript if self.session_name else [],
+            "transcript": self.transcript[-PLAYBACK_LIMIT:] if self.session_name else [],
+            "transcript_total": len(self.transcript) if self.session_name else 0,
             "sessions": self.list_sessions(),
             "need_key": not bool(self.cfg.get("api_key")),
             "vision_ok": bool(_vision_cfg(self.cfg).get("api_key")),
@@ -843,14 +970,32 @@ class Api:
             pass
         return self._state()
 
-    def open_task(self, name):
+    def _find_session_file(self, name):
+        """按任务名定位会话文件：优先 {name}.json；找不到时扫描内部 name 兜底，
+        兼容"文件名与内部 name 不一致"的悬空任务。返回 (路径, 真实name) 或 (None, None)。"""
         p = SESSIONS_DIR / f"{name}.json"
-        if not p.exists():
+        if p.exists():
+            return p, name
+        # 兜底：扫描所有会话，按内部 name 匹配
+        for cp in SESSIONS_DIR.glob("*.json"):
+            try:
+                cd = json.loads(cp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if cd.get("name") == name:
+                return cp, cd.get("name")
+        return None, None
+
+    def open_task(self, name):
+        p, real_name = self._find_session_file(name)
+        if p is None:
             return {"error": "not_found"}
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
         except Exception as e:
             return {"error": str(e)}
+        # 以文件内部 name 为准（防止文件名与 name 不一致导致后续找不到）
+        name = real_name or name
         self.session_name = name
         self.history = data.get("history", [])
         self.transcript = data.get("transcript", [])
@@ -867,7 +1012,8 @@ class Api:
         except Exception:
             pass
         return {
-            "transcript": self.transcript,
+            "transcript": self.transcript[-PLAYBACK_LIMIT:],
+            "transcript_total": len(self.transcript),
             "artifacts": self.artifacts,
             "model": self.model,
             "think_mode": self.think_mode,
@@ -882,8 +1028,10 @@ class Api:
             p = CONFIG_DIR / "last_task.txt"
             if p.exists():
                 name = p.read_text(encoding="utf-8").strip()
-                if name and (SESSIONS_DIR / f"{name}.json").exists():
-                    self.open_task(name)
+                if name:
+                    fp, _ = self._find_session_file(name)
+                    if fp is not None:
+                        self.open_task(name)
         except Exception:
             pass
 
@@ -1068,6 +1216,93 @@ class Api:
         self._stop = True
         return "ok"
 
+    def _is_self_html(self, html_text):
+        """判断 HTML 是否是 MyCodex 自身主界面，避免 iframe 嵌套自己。"""
+        markers = [
+            "window.pywebview",
+            'id="taskList"',
+            'id="messages"',
+            'class="topbar"',
+            "pywebview.api",
+        ]
+        low = html_text.lower()
+        return sum(1 for m in markers if m.lower() in low) >= 3
+
+    def _inline_html_assets(self, html_path, html_text, max_asset_size=1024 * 1024):
+        """
+        把 HTML 中引用的本地相对资源（css/js/图片）内联，使 srcdoc 能正常渲染。
+        只处理与 HTML 同目录的本地相对文件；http/https/data 链接保持原样。
+        """
+        import base64 as _b64
+        base = Path(html_path).resolve().parent
+
+        def _load(rel):
+            rel = rel.strip().strip("\"'")
+            if not rel or rel.startswith(("http://", "https://", "data:", "//", "#")):
+                return None
+            if rel.startswith("/"):
+                return None
+            try:
+                fp = (base / rel).resolve()
+                # 限制只能读取 HTML 所在目录下的文件，防目录遍历
+                if not (fp == base or base in fp.parents):
+                    return None
+                if not fp.is_file() or fp.stat().st_size > max_asset_size:
+                    return None
+                return fp
+            except Exception:
+                return None
+
+        def _css_repl(m):
+            fp = _load(m.group(1))
+            if not fp:
+                return m.group(0)
+            try:
+                return f'<style>{fp.read_text(encoding="utf-8", errors="replace")}</style>'
+            except Exception:
+                return m.group(0)
+
+        def _js_repl(m):
+            fp = _load(m.group(1))
+            if not fp:
+                return m.group(0)
+            try:
+                return f'<script>{fp.read_text(encoding="utf-8", errors="replace")}</script>'
+            except Exception:
+                return m.group(0)
+
+        def _img_repl(m):
+            fp = _load(m.group(1))
+            if not fp:
+                return m.group(0)
+            try:
+                ext = fp.suffix.lower()
+                mime = {
+                    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+                    ".ico": "image/x-icon", ".svg": "image/svg+xml",
+                }.get(ext, "application/octet-stream")
+                data = _b64.b64encode(fp.read_bytes()).decode("ascii")
+                tag = m.group(0)
+                tail = tag[4:]  # 去掉 '<img'
+                return f'<img src="data:{mime};base64,{data}"{tail}'
+            except Exception:
+                return m.group(0)
+
+        html_text = re.sub(
+            r'<link[^>]*?rel=["\']stylesheet["\'][^>]*?href=["\']([^"\']+)["\'][^>]*?>',
+            _css_repl, html_text, flags=re.IGNORECASE
+        )
+        html_text = re.sub(
+            r'<script[^>]*?src=["\']([^"\']+)["\'][^>]*?></script>',
+            _js_repl, html_text, flags=re.IGNORECASE
+        )
+        html_text = re.sub(
+            r'<img[^>]*?src=["\']([^"\']+)["\'][^>]*?>',
+            _img_repl, html_text, flags=re.IGNORECASE
+        )
+        return html_text
+
     def preview(self, path):
         """按文件类型返回可预览内容：
         image → base64 图片；html → 网页源码；md → 文本；pdf/二进制 → 提示外部打开；
@@ -1098,9 +1333,9 @@ class Api:
             # HTML：内嵌网页预览
             if ext in (".html", ".htm"):
                 text = p.read_text(encoding="utf-8", errors="replace")
-                if len(text) > PREVIEW_LIMIT:
-                    text = text[:PREVIEW_LIMIT] + "\n…（预览已截断）"
-                return {**base, "kind": "html", "content": text}
+                text = self._inline_html_assets(str(p), text)
+                is_self = self._is_self_html(text)
+                return {**base, "kind": "html", "content": text, "force_source": bool(is_self)}
             # Markdown：渲染排版
             if ext in (".md", ".markdown"):
                 text = p.read_text(encoding="utf-8", errors="replace")
@@ -1244,6 +1479,10 @@ class Api:
 
     # -------- 工具执行 --------
     def add_artifact(self, path):
+        ctx = self._ctx or {"artifacts": self.artifacts}
+        self._add_artifact_ctx(ctx, path)
+
+    def _add_artifact_ctx(self, ctx, path):
         p = Path(path)
         try:
             st = p.stat()
@@ -1262,13 +1501,50 @@ class Api:
                     entry["url"] = text.splitlines()[0].strip()
             except Exception:
                 pass
-        for i, a in enumerate(self.artifacts):
+        arts = ctx["artifacts"]
+        for i, a in enumerate(arts):
             if a["path"] == str(p):
-                self.artifacts[i] = entry
+                arts[i] = entry
                 self.call_js("updateArtifact", entry)
                 return
-        self.artifacts.append(entry)
+        arts.append(entry)
         self.call_js("addArtifact", entry)
+
+    def _save_ctx(self, ctx):
+        """按线程局部上下文写盘，目标固定为 ctx['task']（防任务串写）。"""
+        target = ctx.get("task")
+        if not target:
+            return
+        data = {
+            "name": target,
+            "model": self.model,
+            "think_mode": self.think_mode,
+            "cwd": str(self.cwd),
+            "updated": time.time(),
+            "pinned": ctx.get("pinned", False),
+            "parent": ctx.get("parent"),
+            "history": ctx["history"],
+            "transcript": ctx["transcript"],
+            "artifacts": ctx["artifacts"],
+        }
+        # 落盘体积保护：超硬上限时丢弃最旧段，避免会话文件膨胀到数 MB 导致加载卡死
+        est = lambda lst: sum(len(json.dumps(m, ensure_ascii=False)) for m in (lst or []))
+        hist = ctx.get("history") or []
+        tr = ctx.get("transcript") or []
+        while est(hist) > TRANSCRIPT_HARD_LIMIT and len(hist) > 2:
+            hist.pop(0)
+        while est(tr) > TRANSCRIPT_HARD_LIMIT and len(tr) > 2:
+            tr.pop(0)
+        ctx["history"] = hist
+        ctx["transcript"] = tr
+
+        p = SESSIONS_DIR / f"{target}.json"
+        tmp = p.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(p)
+        except Exception as e:
+            log("保存会话失败：" + str(e))
 
     def _approve(self, command):
         self._pending_confirm = {"event": threading.Event(), "result": False}
@@ -1307,7 +1583,8 @@ class Api:
         if len(display) > CMD_OUTPUT_LIMIT:
             display = display[:CMD_OUTPUT_LIMIT] + f"\n…（输出已截断，共 {len(result)} 字符）"
         self.call_js("appendToolResult", name, summary, display)
-        self.transcript.append({"role": "tool", "name": name, "text": f"{name}({summary})\n{display}"})
+        ctx = self._ctx or {"history": self.history, "transcript": self.transcript, "artifacts": self.artifacts}
+        ctx["transcript"].append({"role": "tool", "name": name, "text": f"{name}({summary})\n{display}"})
         return str(result)
 
     # -------- 主循环 --------
@@ -1325,6 +1602,16 @@ class Api:
             self._pending_image_kind = "vision" if _vision_cfg(self.cfg).get("api_key") else "ocr"
         if not self.session_name:
             self.new_task()
+        # 创建【线程局部上下文】快照：agent 线程只写这份数据，
+        # 结束后固定写回"发送时所在的任务"，即使期间切换任务也不会串文件。
+        self._ctx = {
+            "task": self.session_name,
+            "history": list(self.history),
+            "transcript": list(self.transcript),
+            "artifacts": list(self.artifacts),
+            "pinned": self.pinned,
+            "parent": self.parent,
+        }
         # 独立线程跑 agent loop，避免阻塞 pywebview 的 API 线程池
         # （否则危险命令确认弹窗会因线程被占而卡死）
         threading.Thread(target=self._run_agent, args=(text,), daemon=True).start()
@@ -1333,9 +1620,11 @@ class Api:
     def _run_agent(self, text):
         self._stop = False
         self._asst_open = False
+        ctx = self._ctx
         self.call_js("setBusy", True)
         self.call_js("appendUser", text, len(self._pending_images))
-        self.transcript.append({"role": "user", "text": text, "image": len(self._pending_images)})
+        if ctx is not None:
+            ctx["transcript"].append({"role": "user", "text": text, "image": len(self._pending_images)})
         try:
             if self._pending_images and self._pending_image_kind == "vision":
                 self._vision_loop(text)
@@ -1347,7 +1636,15 @@ class Api:
             self._pending_images = []
             self._pending_image_kind = None
             self.call_js("setBusy", False)
-            self._save()
+            if ctx is not None:
+                # 固定写回发送时所在的任务文件（不依赖当前 session_name）
+                self._save_ctx(ctx)
+                # 若用户仍未切走，同步内存状态；若已切走则不动，打开时再从文件读
+                if self.session_name == ctx["task"]:
+                    self.history = ctx["history"]
+                    self.transcript = ctx["transcript"]
+                    self.artifacts = ctx["artifacts"]
+                self._ctx = None
             self.call_js("afterSend")
 
     def _ocr_then_agent(self, user_input):
@@ -1398,12 +1695,21 @@ class Api:
         """多模态单轮：把图片/PDF（支持多张）与历史文字上下文一起发给视觉模型。"""
         images = self._pending_images
         v = _vision_cfg(self.cfg)
+        ctx = self._ctx or {
+            "task": self.session_name,
+            "history": self.history,
+            "transcript": self.transcript,
+            "artifacts": self.artifacts,
+        }
         try:
             content = _build_vision_content(user_input, images)
         except Exception as e:
             self.call_js("appendSystem", f"附件处理失败：{e}")
             return
-        messages = [{"role": "system", "content": build_vision_system_prompt()}] + list(self.history)
+        history, compacted = compact_history(ctx["history"])
+        if compacted:
+            self.call_js("appendSystem", "对话历史较长，已自动压缩早期内容以保持流畅")
+        messages = [{"role": "system", "content": build_vision_system_prompt()}] + history
         messages.append({"role": "user", "content": content})
         self._ensure_assistant()
         try:
@@ -1415,25 +1721,39 @@ class Api:
             self._ocr_then_agent(user_input)
             return
         # 存档：图片/文档只在当前轮参与；history 存纯文字，保证后续 DeepSeek 上下文兼容
-        self.history.append({"role": "user", "content": user_input})
-        self.history.append({"role": "assistant", "content": reply})
-        self.transcript.append({"role": "assistant", "text": reply})
+        ctx["history"].append({"role": "user", "content": user_input})
+        ctx["history"].append({"role": "assistant", "content": reply})
+        ctx["transcript"].append({"role": "assistant", "text": reply})
         self.call_js("appendSystem", f"完成（已用视觉模型 {v['provider']}/{v['model']} 理解图片/文档）")
 
     def _agent_loop(self, user_input):
         self._stop = False
+        ctx = self._ctx or {
+            "task": self.session_name,
+            "history": self.history,
+            "transcript": self.transcript,
+            "artifacts": self.artifacts,
+        }
+        # 上下文压缩：防止历史无限膨胀导致请求超时/中断
+        history, compacted = compact_history(ctx["history"])
+        if compacted:
+            self.call_js("appendSystem", "对话历史较长，已自动压缩早期内容以保持流畅")
         messages = [
             {"role": "system", "content": build_system_prompt(self.cwd)},
-        ] + self.history + [
+        ] + history + [
             {"role": "user", "content": user_input},
         ]
+        # 防御性清洗：丢弃压缩/落盘裁剪产生的孤立 tool 消息与悬空 tool_calls，
+        # 避免 DeepSeek 返回 400 invalid_request_error 导致长对话中断
+        messages = sanitize_messages(messages)
         thinking = resolve_think(self.think_mode, user_input)
 
         last_sig = None
         repeat = 0
+        attempt_continue = 0
         try:
             while True:
-                content, reasoning, tool_calls = stream_chat(
+                content, reasoning, tool_calls, finish = stream_chat(
                     messages, self.cfg, TOOLS, thinking, MAX_TOKENS,
                     on_text=self._on_text,
                 )
@@ -1463,9 +1783,9 @@ class Api:
                         for tc in tool_calls
                     ]
                     messages.append(assistant_msg)
-                    self.history.append(assistant_msg)
+                    ctx["history"].append(assistant_msg)
                     if content:
-                        self.transcript.append({"role": "assistant", "text": content})
+                        ctx["transcript"].append({"role": "assistant", "text": content})
                     for tc in tool_calls:
                         result = self._run_tool(tc)
                         messages.append({
@@ -1473,16 +1793,26 @@ class Api:
                             "tool_call_id": tc["id"],
                             "content": result,
                         })
-                        self.history.append({
+                        ctx["history"].append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
                             "content": result,
                         })
                 else:
+                    # 长任务输出被 max_tokens 截断（finish_reason=length）：自动续写，直至完整或达上限
+                    if finish == "length" and attempt_continue < MAX_CONTINUE:
+                        attempt_continue += 1
+                        messages.append(assistant_msg)
+                        ctx["history"].append(assistant_msg)
+                        if content:
+                            ctx["transcript"].append({"role": "assistant", "text": content})
+                        self.call_js("appendSystem", f"输出较长，自动续写第 {attempt_continue} 段…")
+                        messages.append({"role": "user", "content": "（上文被输出上限截断，请继续，不要重复已写内容，从断点处直接接着写，保持格式连贯）"})
+                        continue
                     messages.append(assistant_msg)
-                    self.history.append(assistant_msg)
+                    ctx["history"].append(assistant_msg)
                     if content:
-                        self.transcript.append({"role": "assistant", "text": content})
+                        ctx["transcript"].append({"role": "assistant", "text": content})
                     self.call_js("appendSystem", "完成")
                     break
         except InterruptedError:
