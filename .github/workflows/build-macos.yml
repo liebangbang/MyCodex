@@ -11,6 +11,8 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    permissions:
+      contents: write   # 允许 softprops/action-gh-release 创建 Release
     steps:
       - uses: actions/checkout@v4
 
@@ -22,11 +24,13 @@ jobs:
       - name: Install build deps
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install "pywebview[mac]>=6.0" pyinstaller
+          # 注意：pywebview 不含 [mac] extra，直接装即可（macOS 会自动拉 pyobjc）
+          pip install "pywebview>=6.0" pyinstaller pyobjc
           python -c "import webview; print('webview', webview.__version__)"
 
       - name: Build .app (PyInstaller --onedir)
         run: |
+          set -o pipefail
           python -m PyInstaller --name MyCodex --windowed --onedir \
             --osx-bundle-identifier com.mycodex.app \
             --icon macos/AppIcon.icns \
@@ -37,7 +41,13 @@ jobs:
             --hidden-import "urllib.request" \
             --hidden-import "urllib.error" \
             --hidden-import "PIL" \
-            macos/launcher.py
+            macos/launcher.py 2>&1 | tee /tmp/pyinstaller.log
+
+      - name: Debug on failure
+        if: failure()
+        run: |
+          echo "=== pyinstaller.log ==="; cat /tmp/pyinstaller.log 2>/dev/null || true
+          echo "=== dist ==="; ls -la dist/ 2>/dev/null || true
 
       - name: Create .dmg
         run: |
