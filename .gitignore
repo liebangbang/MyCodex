@@ -22,7 +22,5 @@ dist/
 .DS_Store
 .AppleDouble
 
-# ---------- WorkBuddy 项目数据（仅 skills 入仓，其余本地数据排除） ----------
-.workbuddy/*
-!.workbuddy/skills/
-!.workbuddy/skills/**
+# ---------- WorkBuddy 项目数据（全部本地保留，不入仓，含项目级 skills） ----------
+.workbuddy/
