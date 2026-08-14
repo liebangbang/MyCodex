@@ -17,7 +17,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Install build deps
         run: |
@@ -66,3 +66,25 @@ jobs:
         with:
           name: MyCodex-macOS
           path: dist/MyCodex.dmg
+
+      # 自动发布到 GitHub Release（Actions 自带 GITHUB_TOKEN 即可，无需额外配置）。
+      # 官网下载按钮可永久指向：
+      #   https://github.com/liebangbang/MyCodex/releases/latest/download/MyCodex.dmg
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/MyCodex.dmg
+          name: MyCodex ${{ github.ref_name }}
+          body: |
+            ## MyCodex ${{ github.ref_name }} (macOS)
+
+            独立安装包（.dmg，双击即用，已内置 Python + pywebview）。
+
+            **下载**：MyCodex.dmg
+            **系统要求**：macOS 12+，Apple Silicon / Intel
+            **运行方式**：下载后拖拽 MyCodex.app 到「应用程序」即可。
+
+            > 未做苹果公证，首次打开若提示"身份不明开发者"，右键 → 打开 即可。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
