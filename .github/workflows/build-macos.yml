@@ -1,0 +1,68 @@
+name: Build macOS .dmg
+
+# 在 GitHub Actions 的 macos runner 上打包，彻底绕开本机 8GB 内存限制，
+# 还能顺带做苹果公证（配置好 secrets 后取消注释签名/公证步骤）。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pywebview[mac]>=6.0" pyinstaller
+          npm install -g create-dmg
+
+      - name: Build .app (PyInstaller --onedir)
+        run: |
+          python -m PyInstaller --name MyCodex --windowed --onedir \
+            --osx-bundle-identifier com.mycodex.app \
+            --icon macos/AppIcon.icns \
+            --add-data "app:app" \
+            --add-data "macos/AppIcon.icns:." \
+            --hidden-import "webview.platforms.cocoa" \
+            --hidden-import "webview.platforms" \
+            --hidden-import "urllib.request" \
+            --hidden-import "urllib.error" \
+            --hidden-import "PIL" \
+            macos/launcher.py
+
+      - name: Create .dmg
+        run: |
+          create-dmg dist/MyCodex.dmg dist/MyCodex.app --overwrite
+
+      # 可选：苹果公证（消除"身份不明开发者"警告）。
+      # 需在仓库 Settings -> Secrets 配置：
+      #   MACOS_CERT_P12, CERT_PASSWORD, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+      # 并取消下面注释：
+      # - name: Sign & Notarize
+      #   env:
+      #     MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      #     CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+      #     APPLE_ID: ${{ secrets.APPLE_ID }}
+      #     APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      #     APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      #   run: |
+      #     echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
+      #     security import cert.p12 -k ~/Library/Keychains/login.keychain-db -P "$CERT_PASSWORD" -T /usr/bin/codesign
+      #     codesign --deep --force --options runtime --sign "$APPLE_TEAM_ID" dist/MyCodex.app
+      #     xcrun notarytool submit dist/MyCodex.dmg --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+      #     xcrun stapler staple dist/MyCodex.dmg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyCodex-macOS
+          path: dist/MyCodex.dmg
