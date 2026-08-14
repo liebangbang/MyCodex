@@ -17,13 +17,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: '3.12'
 
       - name: Install build deps
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install "pywebview[mac]>=6.0" pyinstaller
-          npm install -g create-dmg
+          python -c "import webview; print('webview', webview.__version__)"
 
       - name: Build .app (PyInstaller --onedir)
         run: |
@@ -41,7 +41,8 @@ jobs:
 
       - name: Create .dmg
         run: |
-          create-dmg dist/MyCodex.dmg dist/MyCodex.app --overwrite
+          hdiutil create -volname MyCodex -srcfolder dist/MyCodex.app -ov -format UDZO dist/MyCodex.dmg
+          ls -la dist/MyCodex.dmg
 
       # 可选：苹果公证（消除"身份不明开发者"警告）。
       # 需在仓库 Settings -> Secrets 配置：
