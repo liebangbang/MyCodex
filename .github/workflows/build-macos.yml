@@ -62,9 +62,20 @@ jobs:
             const pipLog = read('/tmp/pip.log');
             const log = read('/tmp/pyinstaller.log');
             const dist = cp.execSync('ls -la dist/ 2>/dev/null || echo none').toString();
+            // 只抓取报错相关行 + 上下文，避免被超长的依赖列表淹没
+            const lines = pipLog.split('\n');
+            const seen = new Set();
+            let errText = '';
+            lines.forEach((l, idx) => {
+              if (/error|exception|failed|traceback|subprocess|could not|no matching|conflict|exit code/i.test(l)) {
+                for (let j = Math.max(0, idx - 2); j <= Math.min(lines.length - 1, idx + 4); j++) {
+                  if (!seen.has(j)) { seen.add(j); errText += lines[j] + '\n'; }
+                }
+              }
+            });
             const body = `## Build failed (run ${context.runNumber})\n\n` +
-              `**pip.log (tail):**\n\`\`\`\n${pipLog.slice(-3000)}\n\`\`\`\n\n` +
-              `**pyinstaller.log (tail):**\n\`\`\`\n${log.slice(-3000)}\n\`\`\`\n\n` +
+              `**pip error lines:**\n\`\`\`\n${errText.slice(0, 4000) || '(无匹配行，见完整 tail)'}\n\`\`\`\n\n` +
+              `**pip.log (tail):**\n\`\`\`\n${pipLog.slice(-1500)}\n\`\`\`\n\n` +
               `**dist/:**\n\`\`\`\n${dist}\n\`\`\``;
             await github.rest.issues.create({
               owner: context.repo.owner, repo: context.repo.repo,
