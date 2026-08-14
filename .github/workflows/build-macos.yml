@@ -1,7 +1,9 @@
-name: Build macOS .dmg
+name: Build macOS .dmg (Universal2)
 
-# 在 GitHub Actions 的 macos runner 上打包，彻底绕开本机 8GB 内存限制，
-# 还能顺带做苹果公证（配置好 secrets 后取消注释签名/公证步骤）。
+# 在 GitHub Actions 的 macos runner 上打包，彻底绕开本机 8GB 内存限制。
+# 双架构构建：macos-13 (Intel x86_64) + macos-latest (Apple Silicon arm64)，
+# 再用 lipo 合并成通用二进制 Universal2，单个 .dmg 同时支持 Intel 与 Apple Silicon。
+# 还可顺带做苹果公证（配置好 secrets 后取消注释签名/公证步骤）。
 on:
   workflow_dispatch:
   push:
@@ -10,9 +12,16 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13       # Intel x86_64
+            arch: x86_64
+          - runner: macos-latest   # Apple Silicon arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write   # 允许 softprops/action-gh-release 创建 Release
       issues: write     # 允许失败时把报错自动发到 Issue（便于无 token 调试）
     steps:
       - uses: actions/checkout@v4
@@ -46,11 +55,11 @@ jobs:
             --hidden-import "PIL" \
             macos/launcher.py 2>&1 | tee /tmp/pyinstaller.log
 
-      - name: Debug on failure
-        if: failure()
-        run: |
-          echo "=== pyinstaller.log ==="; cat /tmp/pyinstaller.log 2>/dev/null || true
-          echo "=== dist ==="; ls -la dist/ 2>/dev/null || true
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyCodex-${{ matrix.arch }}
+          path: dist/MyCodex.app
 
       - name: Surface error to issue (debugging)
         if: failure()
@@ -63,16 +72,53 @@ jobs:
             const pipLog = read('/tmp/pip.log');
             const log = read('/tmp/pyinstaller.log');
             const dist = cp.execSync('ls -la dist/ 2>/dev/null || echo none').toString();
-            // 丢弃超长行（pyobjc 依赖清单是单行巨无霸），保留真实报错短行
             const shortLines = pipLog.split('\n').filter(l => l.length < 600);
             const errText = shortLines.slice(-50).join('\n');
-            const body = `## Build failed (run ${context.runNumber})\n\n` +
-              `**pip error / tail (long lines dropped):**\n\`\`\`\n${errText.slice(-4000)}\n\`\`\`\n\n` +
-              `**dist/:**\n\`\`\`\n${dist}\n\`\`\``;
+            const body = `## Build failed (run ${context.runNumber}, arch ${process.env.MATRIX_ARCH})\n\n` +
+              `**pip tail:**\n\`\`\`\n${errText.slice(-4000)}\n\`\`\`\n\n**pyinstaller tail:**\n\`\`\`\n${log.slice(-1500)}\n\`\`\`\n\n**dist/:**\n\`\`\`\n${dist}\n\`\`\``;
             await github.rest.issues.create({
               owner: context.repo.owner, repo: context.repo.repo,
               title: `CI build failed #${context.runNumber}`, body
             });
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+
+  merge:
+    needs: build
+    runs-on: macos-latest
+    permissions:
+      contents: write   # 允许 softprops/action-gh-release 创建 Release
+      issues: write     # 允许失败时把报错自动发到 Issue（便于无 token 调试）
+    steps:
+      - name: Download both arch apps
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Merge into Universal2
+        run: |
+          set -e
+          ARM=artifacts/MyCodex-arm64/MyCodex.app
+          INTEL=artifacts/MyCodex-x86_64/MyCodex.app
+          OUT=dist/MyCodex.app
+          rm -rf dist && mkdir -p dist
+          cp -R "$ARM" "$OUT"
+          # 合并主可执行文件（PyInstaller bootloader 是单架构，必须合并）
+          lipo -create "$ARM/Contents/MacOS/MyCodex" "$INTEL/Contents/MacOS/MyCodex" -output "$OUT/Contents/MacOS/MyCodex"
+          # 合并 _internal 内所有 Mach-O（pyobjc/python 轮子多为 universal2，合并无害；
+          # 若存在单架构二进制则补成通用二进制，确保 Intel 也能跑）
+          BASE="$OUT/Contents/MacOS/_internal"
+          INTBASE="$INTEL/Contents/MacOS/_internal"
+          ( cd "$BASE" && find . -type f -print0 ) | while IFS= read -r -d '' f; do
+            if file "$BASE/$f" | grep -q "Mach-O"; then
+              if [ -f "$INTBASE/$f" ] && file "$INTBASE/$f" | grep -q "Mach-O"; then
+                lipo -create "$BASE/$f" "$INTBASE/$f" -output "$BASE/$f" 2>/dev/null || echo "skip $f"
+              fi
+            fi
+          done
+          echo "=== verify main executable ==="
+          lipo -info "$OUT/Contents/MacOS/MyCodex"
+          file "$OUT/Contents/MacOS/MyCodex"
 
       - name: Create .dmg
         run: |
@@ -82,7 +128,7 @@ jobs:
       # 可选：苹果公证（消除"身份不明开发者"警告）。
       # 需在仓库 Settings -> Secrets 配置：
       #   MACOS_CERT_P12, CERT_PASSWORD, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
-      # 并取消下面注释：
+      # 并取消下面注释（注意公证要在合并之后、打包之前做）：
       # - name: Sign & Notarize
       #   env:
       #     MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
@@ -113,9 +159,10 @@ jobs:
           files: dist/MyCodex.dmg
           name: MyCodex ${{ github.ref_name }}
           body: |
-            ## MyCodex ${{ github.ref_name }} (macOS)
+            ## MyCodex ${{ github.ref_name }} (macOS Universal2)
 
             独立安装包（.dmg，双击即用，已内置 Python + pywebview）。
+            **通用二进制**：单个安装包同时支持 Intel (x86_64) 与 Apple Silicon (arm64)。
 
             **下载**：MyCodex.dmg
             **系统要求**：macOS 12+，Apple Silicon / Intel
@@ -124,3 +171,16 @@ jobs:
             > 未做苹果公证，首次打开若提示"身份不明开发者"，右键 → 打开 即可。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Surface error to issue (debugging)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cp = require('child_process');
+            const dist = cp.execSync('ls -la dist/ 2>/dev/null || echo none').toString();
+            const body = `## Merge/release failed (run ${context.runNumber})\n\n**dist/:**\n\`\`\`\n${dist}\n\`\`\``;
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `CI merge failed #${context.runNumber}`, body
+            });
