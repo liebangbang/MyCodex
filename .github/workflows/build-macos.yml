@@ -24,9 +24,10 @@ jobs:
 
       - name: Install build deps
         run: |
-          python -m pip install --upgrade pip setuptools wheel
+          set -o pipefail
+          python -m pip install --upgrade pip setuptools wheel 2>&1 | tee /tmp/pip.log
           # 注意：pywebview 不含 [mac] extra，直接装即可（macOS 会自动拉 pyobjc）
-          pip install "pywebview>=6.0" pyinstaller pyobjc
+          pip install "pywebview>=6.0" pyinstaller pyobjc 2>&1 | tee -a /tmp/pip.log
           python -c "import webview; print('webview', webview.__version__)"
 
       - name: Build .app (PyInstaller --onedir)
@@ -57,11 +58,13 @@ jobs:
           script: |
             const fs = require('fs');
             const cp = require('child_process');
-            let log = '';
-            try { log = fs.readFileSync('/tmp/pyinstaller.log', 'utf8'); } catch (e) {}
+            const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return ''; } };
+            const pipLog = read('/tmp/pip.log');
+            const log = read('/tmp/pyinstaller.log');
             const dist = cp.execSync('ls -la dist/ 2>/dev/null || echo none').toString();
             const body = `## Build failed (run ${context.runNumber})\n\n` +
-              `**pyinstaller.log (tail):**\n\`\`\`\n${log.slice(-4000)}\n\`\`\`\n\n` +
+              `**pip.log (tail):**\n\`\`\`\n${pipLog.slice(-3000)}\n\`\`\`\n\n` +
+              `**pyinstaller.log (tail):**\n\`\`\`\n${log.slice(-3000)}\n\`\`\`\n\n` +
               `**dist/:**\n\`\`\`\n${dist}\n\`\`\``;
             await github.rest.issues.create({
               owner: context.repo.owner, repo: context.repo.repo,
