@@ -11,6 +11,8 @@ import sys
 import json
 import re
 import time
+import queue
+import signal
 import threading
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -41,6 +43,34 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+def log_error(exc, where="", ctx=None):
+    """把异常完整留档到 error.log（界面只提示一句话，traceback 与上下文写盘），
+    避免每次故障只能靠用户复述弹窗文字。ctx 为 agent 线程上下文时附带任务与消息量。"""
+    try:
+        import traceback
+        tb = traceback.format_exc()
+        info = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "where": where,
+            "error": "%s: %s" % (type(exc).__name__, exc),
+            "traceback": tb,
+        }
+        if ctx:
+            info["task"] = ctx.get("task")
+            info["history_len"] = len(ctx.get("history") or [])
+            info["transcript_len"] = len(ctx.get("transcript") or [])
+        line = json.dumps(info, ensure_ascii=False)
+        try:
+            ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(ERROR_LOG, "a", encoding="utf-8") as _f:
+                _f.write(line + "\n---\n")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    log("ERROR[%s] %s: %s" % (where, type(exc).__name__, exc))
+
+
 # --------------------------------------------------------------------------
 # 配置与常量
 # --------------------------------------------------------------------------
@@ -50,6 +80,7 @@ DEFAULT_MODEL = "deepseek-v4-flash"
 CONFIG_DIR = Path.home() / ".config" / "mycode"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 SESSIONS_DIR = CONFIG_DIR / "sessions"
+ERROR_LOG = CONFIG_DIR / "error.log"   # 异常留档：界面只提示一句话，详情写这里供排查
 
 RISKY_PATTERNS = [
     r"\brm\s+-rf\b", r"\brm\s+-r\b", r"\brm\s+-fr\b",
@@ -64,6 +95,8 @@ RISKY_PATTERNS = [
 CMD_OUTPUT_LIMIT = 40000
 READ_LINE_LIMIT = 2000
 MAX_REPEAT = 3  # 连续相同工具调用超过此值视为死循环，自动停止
+TOOL_EXEC_TIMEOUT = 60  # 文件类工具单次执行超时（秒），防读超大文件/扫巨型目录挂死生成线程
+CMD_EXEC_TIMEOUT = 120  # run_command 单次执行超时（秒）：超时后杀整个进程组并保留已产生的输出
 # 注：对话轮数已设为不限（_agent_loop 用 while True），靠 MAX_REPEAT 防死循环；
 #     如仍需硬性轮数上限，可改回 `for _ in range(N)` 并定义 MAX_TURNS = N。
 MAX_TOKENS = 8192
@@ -417,6 +450,18 @@ def _is_risky(command):
     return any(re.search(p, command) for p in RISKY_PATTERNS)
 
 
+def _kill_process_tree(proc):
+    """杀掉整个进程组（含 shell 派生的子进程），防止超时后编译/测试进程残留继续占用资源。
+    Popen 时用 start_new_session=True 让 shell 成为新进程组组长，这里按进程组号一次清干净。"""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def tool_run_command(args, cwd, approve_fn=None):
     command = args.get("command", "")
     risky = _is_risky(command)
@@ -427,17 +472,31 @@ def tool_run_command(args, cwd, approve_fn=None):
             return "[已取消] 用户拒绝执行命令。"
     try:
         import subprocess
-        proc = subprocess.run(
+        # Popen + communicate 而非 run：超时后仍能拿到已产生的部分输出（run 会全部丢弃），
+        # 让模型能看到"命令跑到哪一步"，而不是面对一片空白；start_new_session 隔离进程组，
+        # 超时杀进程组而非只杀 shell，杜绝子进程残留导致的后续资源卡死。
+        proc = subprocess.Popen(
             command, shell=True, cwd=str(cwd),
-            capture_output=True, text=True, timeout=120, errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace", start_new_session=True,
         )
-        out = proc.stdout or ""
-        if proc.stderr:
-            out += (("\n--- stderr ---\n" + proc.stderr) if out else proc.stderr)
-        out = _truncate(out, CMD_OUTPUT_LIMIT)
-        return out + f"\n[exit code: {proc.returncode}]"
+        timed_out = False
+        try:
+            out, err = proc.communicate(timeout=CMD_EXEC_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process_tree(proc)
+            # 进程组已被杀，再收割一次拿到缓冲区内已产生的输出
+            out, err = proc.communicate()
+        if timed_out:
+            note = f"\n[命令执行超过 {CMD_EXEC_TIMEOUT}s 已终止（含其子进程），以下为超时前已产生的输出]"
+        else:
+            note = ""
+        merged = (out or "") + (("\n--- stderr ---\n" + err) if err else "")
+        merged = _truncate(merged, CMD_OUTPUT_LIMIT)
+        return merged + note + f"\n[exit code: {proc.returncode}]"
     except subprocess.TimeoutExpired:
-        return "[超时] 命令执行超过 120 秒被终止。"
+        return f"[超时] 命令执行超过 {CMD_EXEC_TIMEOUT} 秒被终止。"
     except Exception as e:
         return f"执行错误：{e}"
 
@@ -449,6 +508,28 @@ TOOL_IMPL = {
     "list_dir": tool_list_dir,
     "grep_files": tool_grep_files,
 }
+
+
+def _run_tool_with_timeout(name, args, cwd, timeout=TOOL_EXEC_TIMEOUT):
+    """在独立线程中执行文件类工具并限时，防止读超大文件/扫巨型目录把生成线程永久挂住。
+    run_command 不走这里（内部已有 subprocess 超时与用户确认等待，走自身逻辑）。
+    超时后遗留的 daemon 线程自生自灭（读操作无副作用），主流程立即拿到错误提示交给模型。"""
+    fn = TOOL_IMPL[name]
+    q = queue.Queue(maxsize=1)
+
+    def _worker():
+        try:
+            q.put(("ok", fn(args, cwd)))
+        except Exception as e:
+            q.put(("err", "%s" % e))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return "[超时] 工具 %s 执行超过 %d 秒被终止；请缩小读取范围或换用更精确的路径重试。" % (name, timeout)
+    status, val = q.get()
+    return val if status == "ok" else "执行错误：%s" % val
 
 
 # --------------------------------------------------------------------------
@@ -507,7 +588,19 @@ def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_rea
             last_err = f"HTTP {e.code}: {e.reason}"
             if err_body:
                 last_err += f"\n服务器返回：{err_body}"
-            # 4xx 不重试（参数/鉴权问题），5xx 与网络错误重试
+            if e.code == 429:
+                # 限流（高峰期 DeepSeek 常见）：按服务端 Retry-After 或指数退避重试，
+                # 429 不是参数/鉴权问题，直接判死会让用户误以为"卡断/失败"
+                if attempt >= API_RETRY:
+                    raise RuntimeError(last_err)
+                try:
+                    retry_after = float(e.headers.get("Retry-After", ""))
+                except Exception:
+                    retry_after = 0.0
+                if retry_after > 0:
+                    time.sleep(min(retry_after, 30))
+                continue
+            # 其他 4xx 不重试（参数/鉴权问题），5xx 与网络错误走循环尾部重试
             if 400 <= e.code < 500:
                 raise RuntimeError(last_err)
             if attempt >= API_RETRY:
@@ -1694,7 +1787,8 @@ class Api:
     def _approve(self, command):
         self._pending_confirm = {"event": threading.Event(), "result": False}
         self.call_js("showConfirm", command)
-        self._pending_confirm["event"].wait(timeout=300)
+        # 180s 内无人处理弹窗则按拒绝处理，避免生成线程被弹窗永久挂起（此前 300s 太久）
+        self._pending_confirm["event"].wait(timeout=180)
         res = self._pending_confirm["result"]
         self._pending_confirm = None
         return res
@@ -1716,7 +1810,7 @@ class Api:
         self.call_js("appendTool", name, summary, "")
 
         if name in TOOL_IMPL:
-            result = TOOL_IMPL[name](args, self.cwd)
+            result = _run_tool_with_timeout(name, args, self.cwd)
             if name in ("write_file", "edit_file"):
                 try:
                     self.add_artifact(str(_resolve(args["path"], self.cwd)))
@@ -1733,7 +1827,9 @@ class Api:
         self.call_js("appendToolResult", name, summary, display)
         ctx = self._ctx or {"history": self.history, "transcript": self.transcript, "artifacts": self.artifacts}
         ctx["transcript"].append({"role": "tool", "name": name, "text": f"{name}({summary})\n{display}"})
-        return str(result)
+        # 返回给模型的结果也统一截断：read_file 等文件工具可能吐出超长内容，
+        # 直接进 messages 会撑爆单条消息与上下文，导致下一轮请求超时/超限中断
+        return _truncate(str(result), CMD_OUTPUT_LIMIT)
 
     # -------- 主循环 --------
     def send(self, text, images=None):
@@ -1785,6 +1881,11 @@ class Api:
                 self._agent_loop(text)
         except InterruptedError:
             self.call_js("appendSystem", "已停止")
+        except Exception as e:
+            # daemon 线程的意外异常不会触发 sys.excepthook，必须在这里显式留档，
+            # 否则视觉/OCR/主循环的任何漏网异常都只会静默消失
+            log_error(e, "run_agent", ctx)
+            self.call_js("appendSystem", f"错误：{e}")
         finally:
             self._pending_images = []
             self._pending_image_kind = None
@@ -1864,6 +1965,8 @@ class Api:
             self.call_js("appendSystem", "对话历史较长，已自动压缩早期内容以保持流畅")
         messages = [{"role": "system", "content": build_vision_system_prompt()}] + history
         messages.append({"role": "user", "content": content})
+        # history 可能混入压缩/中断产生的空 assistant 消息，统一清洗防 400
+        messages = sanitize_messages(messages)
         self._ensure_assistant()
         try:
             reply = stream_vision(messages, self.cfg, VISION_MAX_TOKENS, on_text=self._on_text,
@@ -1914,6 +2017,9 @@ class Api:
                 messages, shrunk = ensure_request_size(messages)
                 if shrunk:
                     self.call_js("appendSystem", "上下文较大，已自动压缩以保持请求稳定")
+                # 循环内防御：续写/工具轮次追加的消息也统一清洗，
+                # 杜绝空 assistant 或孤立 tool 消息进入请求体
+                messages = sanitize_messages(messages)
                 content, reasoning, tool_calls, finish = stream_chat(
                     messages, self.cfg, TOOLS, thinking, MAX_TOKENS,
                     on_text=self._on_text,
@@ -1966,9 +2072,12 @@ class Api:
                     # 长任务输出被 max_tokens 截断（length）或流式中断（error）：自动续写，直至完整或达上限
                     if finish in ("length", "error") and attempt_continue < MAX_CONTINUE:
                         attempt_continue += 1
-                        messages.append(assistant_msg)
-                        ctx["history"].append(assistant_msg)
+                        # 关键：中断且未收到任何文本时，绝不能把空的 assistant 消息
+                        # 追加进上下文，否则下一轮请求会触发 DeepSeek 400
+                        # "content or tool_calls must be set"。
                         if content:
+                            messages.append(assistant_msg)
+                            ctx["history"].append(assistant_msg)
                             ctx["transcript"].append({"role": "assistant", "text": content})
                         if finish == "length":
                             self.call_js("appendSystem", f"输出较长，自动续写第 {attempt_continue} 段…")
@@ -1987,12 +2096,15 @@ class Api:
                         ctx["transcript"].append({"role": "assistant", "text": content})
                     if finish == "error":
                         self.call_js("appendSystem", "网络多次中断，已保留已生成内容")
+                    elif finish == "length":
+                        self.call_js("appendSystem", "输出较长，已保留全部已生成内容，可发送「继续」补全剩余部分")
                     else:
                         self.call_js("appendSystem", "完成")
                     break
         except InterruptedError:
             self.call_js("appendSystem", "已停止")
         except Exception as e:
+            log_error(e, "agent_loop", ctx)
             self.call_js("appendSystem", f"错误：{e}")
         finally:
             self._asst_open = False
@@ -2004,10 +2116,63 @@ class Api:
 # --------------------------------------------------------------------------
 # 入口
 # --------------------------------------------------------------------------
+def _acquire_single_instance():
+    """单实例锁：同一时刻只允许一个 MyCodex 进程运行。
+
+    用 fcntl 对 instance.lock 加非阻塞排他锁——锁随进程退出自动释放，
+    即使强杀/崩溃也无需手动清理。副实例会尝试把已运行窗口激活到前台后退出，
+    从根上消除「双进程抢 WebView/会话文件」导致的假死、白屏。"""
+    try:
+        import fcntl
+    except ImportError:
+        return None, True  # 非 Unix 平台放行（本项目面向 macOS）
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        lock_path = CONFIG_DIR / "instance.lock"
+        f = open(lock_path, "w", encoding="utf-8")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # 已有实例持有锁：尝试把它带到前台，然后本进程退出
+        try:
+            import subprocess
+            subprocess.run(
+                ["osascript", "-e", 'tell application "%s" to activate' % APP_NAME],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+        return None, False
+    f.write("%d\n" % os.getpid())
+    f.flush()
+    return f, True
+
+
+def _install_excepthook():
+    """主线程未捕获异常也留档 error.log，避免 GUI 主循环崩溃时无迹可循。"""
+
+    def _hook(etype, evalue, etb):
+        try:
+            import traceback
+            lines = "".join(traceback.format_exception(etype, evalue, etb))
+            ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(ERROR_LOG, "a", encoding="utf-8") as _f:
+                _f.write("%s [excepthook]\n%s\n---\n" % (
+                    time.strftime("%Y-%m-%d %H:%M:%S"), lines))
+        except Exception:
+            pass
+
+    sys.excepthook = _hook
+
+
 def main():
     try:
         import traceback, time, glob, os
-        log("main: importing webview ok")
+        _install_excepthook()
+        lock_f, is_primary = _acquire_single_instance()
+        if not is_primary:
+            log("main: another instance running, activated it and exiting")
+            return
+        log("main: single-instance lock acquired")
         api = Api()
         here = Path(__file__).resolve().parent
         index = here / "index.html"
@@ -2075,6 +2240,7 @@ def main():
     except Exception as e:
         tb = traceback.format_exc()
         log("main EXCEPTION:\n" + tb)
+        log_error(e, "main")
         raise
 
 

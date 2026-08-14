@@ -59,7 +59,13 @@
   let currentAssistantEl = null;
   let currentAssistantRaw = "";
   let currentToolCard = null;
+  let cursorEl = null;              // 流式生成中的闪烁光标
+  let loadMoreBtn = null;           // 消息区顶部「加载更早」按钮
+  let shownTranscriptCount = 0;     // 当前已展示的历史条数（用于分页加载更早）
+  let loadingEarlier = false;       // 加载更早期间禁止滚动跳底
   let busy = false;
+  let busyTick = null;               // 思考/工具阶段状态栏计时器
+  let busySince = 0;                 // 当前忙碌阶段的起点（有输出时重置，区分思考与生成）
   let activeTask = null;
   // 后台生成：发送时所在任务；若生成中切换了任务，流式输出静默（不显示到新任务界面）
   let generatingTask = null;
@@ -74,34 +80,170 @@
       .replace(/'/g, "&#39;");
   }
 
-  // 简易 Markdown：围栏代码块 + 行内代码
-  function renderMarkdown(raw) {
-    const parts = String(raw).split(/```/);
-    let html = "";
-    for (let i = 0; i < parts.length; i++) {
-      if (i % 2 === 1) {
-        let code = parts[i];
-        const nl = code.indexOf("\n");
-        let body = code;
-        if (nl > -1) {
-          const first = code.slice(0, nl).trim();
-          if (/^[a-zA-Z0-9+#-]{1,20}$/.test(first)) body = code.slice(nl + 1);
-        }
-        html += '<pre class="code"><code>' + esc(body.replace(/\n$/, "")) + "</code></pre>";
-      } else {
-        let seg = esc(parts[i]).replace(/`([^`]+)`/g, '<code class="inline">$1</code>');
-        html += seg;
-      }
+  // ---------- 轻量语法高亮（零依赖，覆盖 Python/JS/TS/Java/C 等常见语言） ----------
+  const HL_KEYWORDS = new Set(("def class return if else elif for while import from as try except finally with " +
+    "lambda pass break continue and or not in is None True False async await yield global nonlocal raise assert del self " +
+    "new var let const function export require module typeof instanceof switch case default do void null undefined this super " +
+    "extends interface enum implements public private protected static readonly type namespace declare " +
+    "int float double char long short unsigned signed struct union typedef sizeof goto throw catch final abstract " +
+    "package synchronized volatile native of from").split(" "));
+  const HL_TOKEN_RE = /("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\/\/[^\n]*|#[^\n]*|\/\*[\s\S]*?\*\/|<!--[\s\S]*?-->|\b0x[0-9a-fA-F]+\b|\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|\b[A-Za-z_]\w*\b)/g;
+  function highlightCode(code) {
+    let out = "", last = 0, m;
+    HL_TOKEN_RE.lastIndex = 0;
+    while ((m = HL_TOKEN_RE.exec(code))) {
+      out += esc(code.slice(last, m.index));
+      const t = m[0];
+      let cls = "";
+      if (/^("""|'''|`|"|')/.test(t)) cls = "s";          // 字符串
+      else if (/^(\/\/|#|\/\*|<!--)/.test(t)) cls = "c";  // 注释
+      else if (/^\d/.test(t)) cls = "n";                  // 数字
+      else if (HL_KEYWORDS.has(t)) cls = "k";             // 关键字
+      else if (/^[A-Z]/.test(t)) cls = "t";               // 类型 / 类名（大写开头）
+      if (cls) out += '<span class="tok-' + cls + '">' + esc(t) + "</span>";
+      else out += esc(t);
+      last = m.index + t.length;
     }
+    return out + esc(code.slice(last));
+  }
+
+  // ---------- Markdown 渲染（对话气泡） ----------
+  // 行内样式：行内代码 / 粗体 / 斜体 / 链接（先整体转义，保证安全）
+  function inlineMd(s, cls) {
+    const c = cls || "inline";
+    return esc(s)
+      .replace(/`([^`]+)`/g, '<code class="' + c + '">$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+      .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  }
+  // 表格行拆分：去掉首尾 |，支持 \| 转义
+  function splitRow(l) {
+    let s = String(l || "").trim();
+    if (s.startsWith("|")) s = s.slice(1);
+    if (s.endsWith("|")) s = s.slice(0, -1);
+    s = s.replace(/\\\|/g, "\u0001");
+    return s.split("|").map((c) => c.trim().replace(/\u0001/g, "|"));
+  }
+  // 分隔行单元格对齐：:---: 居中 / ---: 右 / :--- 左
+  function cellAlign(l) {
+    const c = String(l || "").trim();
+    if (/^:?-{1,}:?$/.test(c)) {
+      if (c.startsWith(":") && c.endsWith(":")) return "center";
+      if (c.endsWith(":")) return "right";
+      if (c.startsWith(":")) return "left";
+    }
+    return "";
+  }
+  // 表格 → HTML（外层 .table-wrap 提供横向滚动）
+  function tableToHtml(header, aligns, rows, cls) {
+    const th = (c, k) => "<th" + (aligns[k] ? ' style="text-align:' + aligns[k] + '"' : "") + ">" + inlineMd(c, cls) + "</th>";
+    const td = (c, k) => "<td" + (aligns[k] ? ' style="text-align:' + aligns[k] + '"' : "") + ">" + inlineMd(c, cls) + "</td>";
+    return '<div class="table-wrap"><table><thead><tr>' + header.map(th).join("") +
+      "</tr></thead><tbody>" +
+      rows.map((r) => "<tr>" + r.map(td).join("") + "</tr>").join("") +
+      "</tbody></table></div>";
+  }
+  // 完整 Markdown：代码块 / 行内代码 / 表格 / 标题 / 列表 / 引用 / 粗体 / 斜体 / 链接
+  function renderMarkdown(raw, pfx) {
+    const src = String(raw == null ? "" : raw);
+    const p = pfx || "";
+    // 先抽出围栏代码块，占位保护（避免被行级规则破坏）
+    const blocks = [];
+    let text = src.replace(/```([^\n]*)\n?([\s\S]*?)```/g, (m, first, code) => {
+      let body = code.replace(/^\n/, "").replace(/\n$/, "");
+      let lang = first.trim();
+      if (lang && !/^[a-zA-Z0-9+#-]{1,20}$/.test(lang)) {
+        // 第一行不是纯语言标识（如代码首行），归为代码内容
+        body = first + "\n" + body;
+        lang = "";
+      }
+      blocks.push(
+        '<div class="code-block">' +
+          '<div class="code-head">' +
+            '<span class="code-lang">' + esc(lang || "code") + "</span>" +
+            '<button class="code-copy" type="button">复制</button>' +
+          "</div>" +
+          '<pre class="' + p + 'code"><code>' + highlightCode(body) + "</code></pre>" +
+        "</div>"
+      );
+      return "\u0000CB" + (blocks.length - 1) + "\u0000";
+    });
+    const lines = text.split("\n");
+    const out = [];
+    let inList = false, inQuote = false;
+    const closeList = () => { if (inList) { out.push(inList === "ol" ? "</ol>" : "</ul>"); inList = false; } };
+    const closeQuote = () => { if (inQuote) { out.push("</blockquote>"); inQuote = false; } };
+    const isTableRow = (l) => /^\s*\|.*\|\s*$/.test(l);
+    const isSepRow = (l) => /^\s*\|[\s:|-]+\|\s*$/.test(l) && /-/.test(l);
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      // 表格块：表头行 + 分隔行 + 连续表体行
+      if (isTableRow(line) && isSepRow(lines[i + 1] || "")) {
+        closeList(); closeQuote();
+        const header = splitRow(line);
+        const aligns = splitRow(lines[i + 1]).map(cellAlign);
+        i += 2;
+        const rows = [];
+        while (i < lines.length && isTableRow(lines[i])) { rows.push(splitRow(lines[i])); i++; }
+        out.push(tableToHtml(header, aligns, rows, p + "inline"));
+        continue;
+      }
+      // 代码块占位行
+      if (/^\u0000CB\d+\u0000$/.test(line.trim())) { closeList(); closeQuote(); out.push(line.trim()); i++; continue; }
+      // 标题
+      const h = line.match(/^(#{1,4})\s+(.*)$/);
+      if (h) { closeList(); closeQuote(); out.push("<h" + h[1].length + ">" + inlineMd(h[2], p + "inline") + "</h" + h[1].length + ">"); i++; continue; }
+      // 列表（无序 / 有序）
+      const ol = line.match(/^\s*\d+[.)]\s+/);
+      if (/^\s*[-*+]\s+/.test(line) || ol) {
+        if (!inList) {
+          closeQuote();
+          inList = ol ? "ol" : "ul";
+          out.push(inList === "ol" ? "<ol>" : "<ul>");
+        }
+        let content = line.replace(/^\s*[-*+]\s+/, "").replace(/^\s*\d+[.)]\s+/, "");
+        // 任务列表：- [ ] / - [x]
+        const task = content.match(/^\[([ xX])\]\s+(.*)$/);
+        if (task && !ol) {
+          const checked = task[1].toLowerCase() === "x";
+          content = '<span class="task-cb' + (checked ? " checked" : "") + '">' +
+            '<svg class="icon" viewBox="0 0 24 24">' + (checked
+              ? '<rect x="3.5" y="3.5" width="17" height="17" rx="4.5"/><path d="m8.5 12.5 2.5 2.5 5-5.5"/>'
+              : '<rect x="3.5" y="3.5" width="17" height="17" rx="4.5"/>') +
+            "</svg></span>" + inlineMd(task[2], p + "inline");
+        } else {
+          content = inlineMd(content, p + "inline");
+        }
+        out.push("<li>" + content + "</li>");
+        i++; continue;
+      }
+      // 引用
+      if (/^\s*>\s?/.test(line)) {
+        if (!inQuote) { closeList(); out.push("<blockquote>"); inQuote = true; }
+        out.push(inlineMd(line.replace(/^\s*>\s?/, ""), p + "inline"));
+        i++; continue;
+      }
+      closeList(); closeQuote();
+      if (!line.trim()) { out.push(""); i++; continue; }
+      out.push("<p>" + inlineMd(line, p + "inline") + "</p>");
+      i++;
+    }
+    closeList(); closeQuote();
+    let html = out.join("\n");
+    html = html.replace(/\u0000CB(\d+)\u0000/g, (m, k) => blocks[+k]);
     return html;
   }
 
   function scrollDown() {
+    if (loadingEarlier) return;  // 加载更早消息时保持当前位置
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
   // 完成当前助手气泡的 Markdown 渲染
   function finalizeAssistant() {
+    if (cursorEl) { cursorEl.remove(); cursorEl = null; }
     if (currentAssistantEl) {
       const content = currentAssistantEl.querySelector(".bubble");
       if (content) content.innerHTML = renderMarkdown(currentAssistantRaw);
@@ -120,13 +262,13 @@
             btn.classList.remove("copied");
           }, 1500);
         }));
-        m.appendChild(btn);
+        const col = m.querySelector(".msg-col");
+        (col || m).appendChild(btn);
       }
       currentAssistantEl = null;
       currentAssistantRaw = "";
     }
   }
-
   // ---------------- 复制（三层兜底） ----------------
   // 1) Clipboard API → 2) pywebview 桥接(NSPasteboard) → 3) execCommand 兼容
   function fallbackCopyText(text) {
@@ -179,6 +321,7 @@
   let _pendingThumbs = [];
   function appendUser(text, imgCount) {
     finalizeAssistant();
+    hideEmptyState();
     const m = document.createElement("div");
     m.className = "msg user";
     const b = document.createElement("div");
@@ -210,6 +353,7 @@
 
   function beginAssistant() {
     finalizeAssistant();
+    cursorEl = null;
     // 若已切到其他任务，生成中的输出静默（写盘仍归发送时任务）
     if (generatingTask && generatingTask !== activeTask) {
       streamHidden = true;
@@ -218,15 +362,35 @@
       return;
     }
     streamHidden = false;
+    hideEmptyState();
     const m = document.createElement("div");
     m.className = "msg assistant";
+    // 头像 + 内容列（标签在上、气泡在下）
+    const avatar = document.createElement("div");
+    avatar.className = "asst-avatar";
+    if (window.__APP_ICON__) {
+      const aimg = document.createElement("img");
+      aimg.src = window.__APP_ICON__;
+      aimg.alt = "MyCodex";
+      avatar.appendChild(aimg);
+    } else {
+      avatar.textContent = "M";
+    }
+    const col = document.createElement("div");
+    col.className = "msg-col";
     const label = document.createElement("div");
     label.className = "msg-label";
     label.textContent = "MyCodex";
     const b = document.createElement("div");
     b.className = "bubble";
-    m.appendChild(label);
-    m.appendChild(b);
+    // 流式光标：提示正在生成
+    cursorEl = document.createElement("span");
+    cursorEl.className = "cursor";
+    b.appendChild(cursorEl);
+    col.appendChild(label);
+    col.appendChild(b);
+    m.appendChild(avatar);
+    m.appendChild(col);
     messagesEl.appendChild(m);
     currentAssistantEl = m;
     currentAssistantRaw = "";
@@ -240,8 +404,11 @@
     }
     if (!currentAssistantEl) beginAssistant();
     currentAssistantRaw += t;
+    // 开始有真实输出了：计时起点归零，"进行中 Ns"从生成首字重新计
+    if (busySince) busySince = Date.now();
     const b = currentAssistantEl.querySelector(".bubble");
-    b.appendChild(document.createTextNode(t));
+    if (cursorEl) b.insertBefore(document.createTextNode(t), cursorEl);
+    else b.appendChild(document.createTextNode(t));
     scrollDown();
   }
 
@@ -251,6 +418,7 @@
 
   function appendSystem(msg) {
     finalizeAssistant();
+    hideEmptyState();
     const s = document.createElement("div");
     s.className = "sys-line";
     s.textContent = msg;
@@ -285,6 +453,7 @@
 
   function appendTool(name, summary) {
     finalizeAssistant();
+    hideEmptyState();
     if (streamHidden) { currentToolCard = null; return; }
     const card = document.createElement("div");
     card.className = "tool-card";
@@ -572,50 +741,98 @@
     previewEl.scrollTop = 0;
   }
 
-  // Markdown 完整渲染（预览区用）：标题 / 列表 / 引用 / 加粗 / 链接 / 行内代码 / 代码块
+  // Markdown 完整渲染（预览区用）：复用 renderMarkdown，仅换类名前缀（md-*）
   function renderMarkdownFull(raw) {
-    const src = String(raw == null ? "" : raw);
-    // 先处理代码块，占位保护
-    const blocks = [];
-    let text = src.replace(/```([\s\S]*?)```/g, (m, code) => {
-      blocks.push('<pre class="md-code"><code>' + esc(code.replace(/^\n/, "").replace(/\n$/, "")) + "</code></pre>");
-      return "\u0000MD" + (blocks.length - 1) + "\u0000";
-    });
-    const lines = text.split("\n");
-    const html = [];
-    let inList = false, inQuote = false;
-    const closeList = () => { if (inList) { html.push("</ul>"); inList = false; } };
-    const closeQuote = () => { if (inQuote) { html.push("</blockquote>"); inQuote = false; } };
-    for (let line of lines) {
-      const inline = (s) => s
-        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-        .replace(/`([^`]+)`/g, '<code class="md-inline">$1</code>')
-        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-      const h = line.match(/^(#{1,4})\s+(.*)$/);
-      if (h) { closeList(); closeQuote(); html.push("<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">"); continue; }
-      if (/^\s*[-*+]\s+/.test(line)) {
-        if (!inList) { closeQuote(); html.push("<ul>"); inList = true; }
-        html.push("<li>" + inline(line.replace(/^\s*[-*+]\s+/, "")) + "</li>"); continue;
-      }
-      if (/^\s*>\s?/.test(line)) {
-        if (!inQuote) { closeList(); html.push("<blockquote>"); inQuote = true; }
-        html.push(inline(line.replace(/^\s*>\s?/, ""))); continue;
-      }
-      closeList(); closeQuote();
-      if (!line.trim()) { html.push(""); continue; }
-      html.push("<p>" + inline(line) + "</p>");
-    }
-    closeList(); closeQuote();
-    let out = html.join("\n");
-    out = out.replace(/\u0000MD(\d+)\u0000/g, (m, i) => blocks[+i]);
-    return out;
+    return renderMarkdown(raw, "md-");
   }
 
   // ---------------- 任务列表 ----------------
+  // 相对时间（刚刚 / N 分钟前 / N 小时前 / 昨天 HH:mm / M月D日）
+  function relTime(ts) {
+    const d = new Date((ts || 0) * 1000);
+    if (isNaN(d.getTime())) return "";
+    const diff = (Date.now() - d.getTime()) / 1000;
+    if (diff < 45) return "刚刚";
+    if (diff < 3600) return Math.floor(diff / 60) + " 分钟前";
+    if (diff < 86400) return Math.floor(diff / 3600) + " 小时前";
+    if (diff < 172800) {
+      const hm = d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+      return "昨天 " + hm;
+    }
+    if (d.getFullYear() === new Date().getFullYear())
+      return d.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+    return d.toLocaleDateString("zh-CN", { year: "numeric", month: "numeric", day: "numeric" });
+  }
+
+  const ICON_TASK = '<svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5c-1.2 0-2.4-.26-3.4-.73L3 21l1.5-5.1A8.5 8.5 0 1 1 21 11.5z"/></svg>';
+  const ICON_PIN_SM = '<svg class="icon" viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 4h6l-1 7 3 3H7l3-3z"/></svg>';
+  const ICON_EDIT = '<svg class="icon" viewBox="0 0 24 24"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>';
+  const ICON_ADD = '<svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>';
+  const ICON_TRASH = '<svg class="icon" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>';
+
+  // ---- 任务「⋯」更多下拉菜单：把重命名/置顶/新建子任务/删除收进菜单，
+  //      需点击两次才触发，彻底杜绝滑过列表时的误触 ----
+  let taskMenuEl = null;
+  function ensureTaskMenu() {
+    if (taskMenuEl) return taskMenuEl;
+    taskMenuEl = document.createElement("div");
+    taskMenuEl.className = "task-menu";
+    taskMenuEl.innerHTML =
+      '<button data-act="rename">' + ICON_EDIT + "<span>重命名</span></button>" +
+      '<button data-act="pin">' + ICON_PIN_SM + "<span>置顶</span></button>" +
+      '<button data-act="sub">' + ICON_ADD + "<span>新建子任务</span></button>" +
+      '<div class="task-menu-sep"></div>' +
+      '<button data-act="del" class="danger">' + ICON_TRASH + "<span>删除任务</span></button>";
+    taskMenuEl.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-act]");
+      if (!btn) return;
+      const name = taskMenuEl.dataset.name;
+      const act = btn.dataset.act;
+      closeTaskMenu();
+      if (act === "rename") renameTask(name);
+      else if (act === "pin") togglePin(name);
+      else if (act === "sub") newSubtask(name);
+      else if (act === "del") deleteTask(name);
+    });
+    document.body.appendChild(taskMenuEl);
+    document.addEventListener("click", (e) => {
+      if (taskMenuEl.style.display !== "none" &&
+          !taskMenuEl.contains(e.target) &&
+          !(e.target.closest && e.target.closest(".task-btn.more"))) {
+        closeTaskMenu();
+      }
+    });
+    window.addEventListener("resize", closeTaskMenu);
+    taskListEl.addEventListener("scroll", closeTaskMenu);
+    return taskMenuEl;
+  }
+
+  function openTaskMenu(name, anchorEl) {
+    const menu = ensureTaskMenu();
+    const pinned = (window._sessionsCache || []).some((s) => s.name === name && s.pinned);
+    menu.querySelector('[data-act="pin"]').innerHTML =
+      ICON_PIN_SM + "<span>" + (pinned ? "取消置顶" : "置顶") + "</span>";
+    menu.dataset.name = name;
+    anchorEl.classList.add("open");
+    menu.style.display = "block";
+    menu.style.left = "0px"; menu.style.top = "0px"; // 先归零，便于测量真实尺寸
+    const mw = menu.offsetWidth, mh = menu.offsetHeight;
+    const r = anchorEl.getBoundingClientRect();
+    let x = Math.max(8, r.right - mw);
+    let y = r.bottom + 4;
+    if (y + mh > window.innerHeight - 8) y = Math.max(8, r.top - mh - 4);
+    menu.style.left = x + "px";
+    menu.style.top = y + "px";
+  }
+
+  function closeTaskMenu() {
+    if (taskMenuEl) taskMenuEl.style.display = "none";
+    document.querySelectorAll(".task-btn.more.open").forEach((b) => b.classList.remove("open"));
+  }
+
   function renderSessions(sessions) {
     taskListEl.innerHTML = "";
-    // 按 parent 分组：先渲染根任务，再渲染其子任务（缩进）
+    // 按 parent 分组：主任务 → 其子任务（树形缩进 + 连接线，主/子层级一目了然）
     const byParent = {};
     sessions.forEach((s) => {
       const key = s.parent || "";
@@ -624,12 +841,18 @@
     const roots = byParent[""] || [];
     const rendered = new Set();
     roots.forEach((root) => {
-      taskListEl.appendChild(makeTaskItem(root, 0));
+      const children = byParent[root.name] || [];
+      taskListEl.appendChild(makeTaskItem(root, 0, children.length));
       rendered.add(root.name);
-      (byParent[root.name] || []).forEach((child) => {
-        taskListEl.appendChild(makeTaskItem(child, 1));
-        rendered.add(child.name);
-      });
+      if (children.length) {
+        const group = document.createElement("div");
+        group.className = "task-sub-group";
+        children.forEach((child) => {
+          group.appendChild(makeTaskItem(child, 1));
+          rendered.add(child.name);
+        });
+        taskListEl.appendChild(group);
+      }
     });
     // 兜底：父任务已不存在（孤儿子任务）也作为根展示，避免丢失
     sessions.forEach((s) => {
@@ -648,6 +871,11 @@
       const hit = !q || name.indexOf(q) > -1;
       it.style.display = hit ? "" : "none";
       if (hit) visible++;
+    });
+    // 子任务分组：组内已无可见子任务时隐藏整组，避免残留竖线
+    taskListEl.querySelectorAll(".task-sub-group").forEach((g) => {
+      const anyVisible = Array.prototype.some.call(g.querySelectorAll(".task-item"), (it) => it.style.display !== "none");
+      g.style.display = anyVisible ? "" : "none";
     });
     let emptyEl = $("taskEmpty");
     if (!emptyEl) {
@@ -714,50 +942,36 @@
     taskSearchEl.focus();
   };
 
-  function makeTaskItem(s, depth) {
+  function makeTaskItem(s, depth, childrenCount) {
     const item = document.createElement("div");
     item.className = "task-item" + (s.name === activeTask ? " active" : "") + (s.pinned ? " pinned" : "");
     item.dataset.name = s.name;
     item.dataset.depth = depth;
-    const date = new Date((s.updated || 0) * 1000);
-    const rel = isNaN(date) ? "" : date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
-    const indent = depth > 0 ? ' style="padding-left:' + (26 + depth * 16) + 'px"' : "";
+    const time = relTime(s.updated);
     item.innerHTML =
       '<div class="task-row">' +
-        '<div class="task-main"' + indent + ">" +
-          '<div class="task-text">' +
-            '<div class="task-name">' + (depth > 0 ? "↳ " : "") + esc(s.name) + "</div>" +
-            '<div class="task-meta">' +
-              (depth > 0 ? "子任务 · " : "") +
-              (s.msg_count || 0) + " 条 · " + esc(rel) +
-            "</div>" +
+        '<span class="task-icon' + (depth > 0 ? " sub" : "") + '">' + (depth > 0 ? "" : ICON_TASK) + "</span>" +
+        '<div class="task-main">' +
+          '<div class="task-name">' +
+            (depth > 0 ? '<span class="task-sub-tag">子任务</span>' : "") +
+            '<span class="task-name-text">' + esc(s.name) + "</span>" +
+          "</div>" +
+          '<div class="task-meta">' +
+            (s.pinned ? '<span class="task-pin-badge">' + ICON_PIN_SM + "置顶</span>" : "") +
+            (depth === 0 && childrenCount > 0 ? '<span class="task-sub-count">' + childrenCount + " 个子任务</span>" : "") +
+            (time ? '<span class="task-time">' + esc(time) + "</span>" : "") +
           "</div>" +
         "</div>" +
         '<div class="task-actions">' +
-          '<button class="task-btn" title="重命名" data-act="rename">' +
-            '<svg class="icon" viewBox="0 0 24 24"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>' +
-          "</button>" +
-          '<button class="task-btn' + (s.pinned ? " pinned" : "") + '" title="' + (s.pinned ? "取消置顶" : "置顶") + '" data-act="pin">' +
-            '<svg class="icon" viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 4h6l-1 7 3 3H7l3-3z"/></svg>' +
-          "</button>" +
-          '<button class="task-btn" title="新建子任务" data-act="sub">' +
-            '<svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>' +
-          "</button>" +
-          '<button class="task-btn danger" title="删除任务" data-act="del">' +
-            '<svg class="icon" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>' +
+          '<button class="task-btn more" title="更多操作">' +
+            '<svg class="icon" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.8" fill="currentColor"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><circle cx="19" cy="12" r="1.8" fill="currentColor"/></svg>' +
           "</button>" +
         "</div>" +
       "</div>";
     item.onclick = () => openTask(s.name);
-    item.querySelectorAll(".task-btn").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const act = btn.dataset.act;
-        if (act === "rename") renameTask(s.name);
-        else if (act === "pin") togglePin(s.name);
-        else if (act === "sub") newSubtask(s.name);
-        else if (act === "del") deleteTask(s.name);
-      });
+    item.querySelector(".task-btn.more").addEventListener("click", (e) => {
+      e.stopPropagation();
+      openTaskMenu(s.name, e.currentTarget);
     });
     return item;
   }
@@ -826,6 +1040,7 @@
   }
 
   function openTask(name) {
+    closeTaskMenu();
     if (!apiReady()) return;
     window.pywebview.api.open_task(name).then((res) => {
       if (res.error) return;
@@ -843,10 +1058,57 @@
 
   // 回放历史：若历史被截断（仅返回最近 N 条），顶部提示，避免用户误以为对话丢失
   function playTranscriptRange(entries, total) {
+    shownTranscriptCount = entries.length;
     if (total > entries.length) {
-      appendSystem("对话历史较长，仅显示最近 " + entries.length + " 条（共 " + total + " 条）");
+      addLoadMoreBtn(total);
     }
     entries.forEach(playTranscript);
+  }
+
+  // 消息区顶部「加载更早消息」按钮（点击分页加载，不回跳滚动位置）
+  function addLoadMoreBtn(total) {
+    if (loadMoreBtn) return;
+    loadMoreBtn = document.createElement("button");
+    loadMoreBtn.className = "load-more-btn";
+    loadMoreBtn.textContent = "↑ 加载更早消息（共 " + total + " 条，当前显示最近 " + shownTranscriptCount + " 条）";
+    loadMoreBtn.addEventListener("click", loadEarlier);
+    messagesEl.insertBefore(loadMoreBtn, messagesEl.firstChild);
+  }
+
+  function loadEarlier() {
+    if (!apiReady() || !loadMoreBtn || loadingEarlier) return;
+    loadingEarlier = true;
+    const keep = messagesEl.scrollHeight - messagesEl.scrollTop;
+    window.pywebview.api.load_earlier(shownTranscriptCount).then((res) => {
+      loadingEarlier = false;
+      if (!res || res.error) {
+        appendSystem("加载更早消息失败：" + ((res && res.error) || "未知错误"));
+        return;
+      }
+      const entries = res.entries || [];
+      if (!entries.length) {
+        if (loadMoreBtn) { loadMoreBtn.remove(); loadMoreBtn = null; }
+        return;
+      }
+      // 先把新条目渲染到末尾，再整体移到顶部按钮之后（保持时间正序）
+      const before = messagesEl.children.length;
+      entries.forEach(playTranscript);
+      const moved = Array.from(messagesEl.children).slice(before);
+      const anchor = loadMoreBtn ? loadMoreBtn.nextSibling : messagesEl.firstChild;
+      moved.forEach((n) => messagesEl.insertBefore(n, anchor));
+      shownTranscriptCount += entries.length;
+      if (res.remaining <= 0 && loadMoreBtn) {
+        loadMoreBtn.remove();
+        loadMoreBtn = null;
+      } else if (loadMoreBtn) {
+        loadMoreBtn.textContent = "↑ 加载更早消息（剩余 " + res.remaining + " 条）";
+      }
+      // 恢复滚动位置：内容插在顶部，滚动条相对位置不变
+      messagesEl.scrollTop = messagesEl.scrollHeight - keep;
+    }).catch((e) => {
+      loadingEarlier = false;
+      appendSystem("加载更早消息失败：" + e);
+    });
   }
 
   function playTranscript(entry) {
@@ -874,6 +1136,31 @@
     currentAssistantEl = null;
     currentAssistantRaw = "";
     currentToolCard = null;
+    cursorEl = null;
+    loadMoreBtn = null;
+    shownTranscriptCount = 0;
+    loadingEarlier = false;
+    updateEmptyState();
+  }
+
+  // ---------------- 空态引导 ----------------
+  const emptyStateEl = $("emptyState");
+  function hideEmptyState() {
+    if (emptyStateEl) emptyStateEl.style.display = "none";
+  }
+  function updateEmptyState() {
+    if (!emptyStateEl) return;
+    const hasMsg = messagesEl.children.length > 0;
+    emptyStateEl.style.display = hasMsg ? "none" : "flex";
+  }
+  if (emptyStateEl) {
+    emptyStateEl.querySelectorAll(".chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        inputEl.value = chip.dataset.prompt || "";
+        autoResize();
+        inputEl.focus();
+      });
+    });
   }
   // ---------------- 头部 / 状态 ----------------
   function setHeader(st) {
@@ -894,7 +1181,22 @@
     busy = b;
     $("btnSend").disabled = b;
     $("btnStop").style.display = b ? "" : "none";
-    statusEl.textContent = b ? "思考中…" : "";
+    $("btnStop").disabled = false;
+    $("btnStop").textContent = "停止";
+    // 状态栏动态计时：思考/工具执行可能持续数十秒~数分钟，
+    // 只显示"思考中"三个字会让用户误以为卡死；每 1s 刷新已等待秒数
+    if (busyTick) { clearInterval(busyTick); busyTick = null; }
+    if (b) {
+      busySince = Date.now();
+      const tick = () => {
+        const s = Math.round((Date.now() - busySince) / 1000);
+        statusEl.textContent = "进行中 " + s + "s";
+      };
+      tick();
+      busyTick = setInterval(tick, 1000);
+    } else {
+      statusEl.textContent = "";
+    }
     statusEl.classList.toggle("busy", b);
   }
 
@@ -1012,22 +1314,31 @@
     fileImgEl.value = "";
   }
 
+  // 附件大小上限：超大 PDF 会拖垮 JS↔Python 桥接与视觉 API，发送前先警告
+  const MAX_ATTACH_BYTES = 15 * 1024 * 1024;
+
   function handleImageFile(file) {
     if (!file) return;
-    const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name || "");
+    const name = file.name || "";
+    const type = file.type || "";
+    // 类型识别：优先 MIME，其次扩展名（macOS 面板部分场景 type 为空）
+    const isPdf = type === "application/pdf" || /\.pdf$/i.test(name);
     if (isPdf) {
+      if (file.size > MAX_ATTACH_BYTES) {
+        appendSystem("⚠️ PDF 较大（" + (file.size / 1048576).toFixed(1) + " MB），转换与上传可能较慢");
+      }
       const reader = new FileReader();
-      reader.onload = () => addPendingImage(reader.result, file.name, "pdf");
+      reader.onload = () => addPendingImage(reader.result, name, "pdf");
       reader.onerror = () => appendSystem("读取 PDF 失败");
       reader.readAsDataURL(file);
       return;
     }
-    if (!/^image\//.test(file.type || "")) {
-      appendSystem("仅支持图片（PNG/JPG 等）或 PDF 文档");
+    if (!/^image\//.test(type) && !/\.(png|jpe?g|gif|webp|bmp|svg|ico|heic)$/i.test(name)) {
+      appendSystem("仅支持图片（PNG/JPG/GIF/WebP 等）或 PDF 文档，已忽略：" + name);
       return;
     }
     const reader = new FileReader();
-    reader.onload = () => addPendingImage(reader.result, file.name, "image");
+    reader.onload = () => addPendingImage(reader.result, name, "image");
     reader.onerror = () => appendSystem("读取图片失败");
     reader.readAsDataURL(file);
   }
@@ -1081,13 +1392,14 @@
   $("btnImgCancel").onclick = clearImgPreview;
   $("btnOcr").onclick = () => { runOcr(); };
 
-  // 粘贴图片（支持一次粘贴多张）
+  // 粘贴图片/PDF（支持一次粘贴多张）
   document.addEventListener("paste", (e) => {
     if (!e.clipboardData || !e.clipboardData.items) return;
     const items = e.clipboardData.items;
     let added = false;
     for (let i = 0; i < items.length; i++) {
-      if (items[i].type && items[i].type.indexOf("image/") === 0) {
+      const t = items[i].type || "";
+      if (t.indexOf("image/") === 0 || t === "application/pdf") {
         const file = items[i].getAsFile();
         if (file) {
           e.preventDefault();
@@ -1127,7 +1439,14 @@
     // 普通 Enter：默认换行（textarea 原生行为），不发送
   });
   $("btnSend").onclick = doSend;
-  $("btnStop").onclick = () => { if (apiReady()) window.pywebview.api.stop(); };
+  $("btnStop").onclick = () => {
+    if (!apiReady()) return;
+    // 即时反馈：禁用按钮防止连点，提示正在停止（后端最多 2s 内响应中断）
+    const b = $("btnStop");
+    b.disabled = true;
+    b.textContent = "停止中…";
+    window.pywebview.api.stop();
+  };
 
   modelSel.onchange = () => { if (apiReady()) window.pywebview.api.set_model(modelSel.value); };
   thinkSel.onchange = () => { if (apiReady()) window.pywebview.api.set_think_mode(thinkSel.value); };
@@ -1201,6 +1520,22 @@
     $("modalMask").style.display = "none";
     if (apiReady()) window.pywebview.api.confirm_response(true);
   };
+
+  // 代码块「复制」按钮（事件委托：流式渲染 / 分页加载 / 预览区的代码块都覆盖）
+  document.addEventListener("click", (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest(".code-copy") : null;
+    if (!btn) return;
+    const block = btn.closest(".code-block");
+    const pre = block && block.querySelector("pre code");
+    if (!pre) return;
+    const text = pre.innerText || pre.textContent || "";
+    const done = (ok) => {
+      btn.textContent = ok ? "已复制" : "复制失败";
+      btn.classList.toggle("copied", !!ok);
+      setTimeout(() => { btn.textContent = "复制"; btn.classList.remove("copied"); }, 1600);
+    };
+    copyText(text, done);
+  });
 
   // 暴露给后端调用的全局函数
   window.appendUser = appendUser;

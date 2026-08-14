@@ -7,7 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>MyCodex</title>
-  <link rel="stylesheet" href="style.css?v=4" />
+  <link rel="stylesheet" href="style.css?v=12" />
 </head>
 <body>
   <div class="app">
@@ -68,6 +68,19 @@
           <span class="status" id="statusText"></span>
         </div>
         <div class="messages" id="messages"></div>
+        <!-- 空态引导（无消息时显示） -->
+        <div class="empty-state" id="emptyState">
+          <div class="empty-logo">
+            <img src="{{APP_ICON}}" alt="MyCodex" />
+          </div>
+          <div class="empty-title">开始新的编码任务</div>
+          <div class="empty-sub">直接输入指令，或点下面的快捷操作试试</div>
+          <div class="empty-chips">
+            <button class="chip" data-prompt="审查当前工作目录项目的代码质量，给出改进建议">审查代码</button>
+            <button class="chip" data-prompt="总结这个项目的结构和功能">项目概览</button>
+            <button class="chip" data-prompt="帮我排查当前项目里的问题">排查问题</button>
+          </div>
+        </div>
         <div class="composer">
           <div class="composer-bar">
             <select id="modelSel" class="select" title="模型">
@@ -101,7 +114,7 @@
               <button class="btn ghost small" id="btnImgCancel" title="移除全部附件">移除</button>
             </div>
           </div>
-          <input type="file" id="fileImg" accept="image/*,.pdf" multiple style="display:none" />
+          <input type="file" id="fileImg" accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.bmp,.svg,.ico,.heic" multiple style="display:none" />
         </div>
       </main>
 
@@ -145,6 +158,7 @@
     </div>
   </div>
 
-  <script src="app.js?v=4"></script>
+  <script>window.__APP_ICON__ = "{{APP_ICON}}";</script>
+  <script src="app.js?v=12"></script>
 </body>
 </html>
