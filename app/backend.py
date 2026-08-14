@@ -15,6 +15,7 @@ import threading
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+import socket
 
 import webview
 
@@ -75,9 +76,13 @@ VISION_MAX_PDF_PAGES = 5   # PDF 最多转 5 页发给视觉模型
 CTX_HARD_LIMIT = 150        # 发给模型的 history 消息数硬上限（超出则压缩）
 CTX_SOFT_LIMIT = 400_000    # 发给模型的 history 总字符软上限（超出则压缩）
 CTX_KEEP_RECENT = 40        # 压缩时保留最近 N 条完整消息（含本轮 user）
+CTX_HARD_BYTES = 800_000    # 请求体序列化字节硬上限（发送前超出则强制压缩，防 API 超限/超时中断）
+MAX_MSG_CHARS = 120_000     # 单条消息字符上限（发送前截断，防超大粘贴/日志导致请求超限）
 PLAYBACK_LIMIT = 80         # 启动/打开任务时，界面最多回放的历史消息条数（防卡顿）# 网络重试：连接建立阶段可重试（未开始流式输出时）；进入流式后不重试避免重复内容
 API_RETRY = 3               # 最大重试次数（指数退避 1/2/4s）
 API_RETRY_BASE_DELAY = 1.0
+STREAM_READ_TIMEOUT = 2.0   # 流式读取单次 socket 超时（秒）：期间可及时响应「停止」
+STREAM_IDLE_LIMIT = 600.0   # 流式长时间无数据（秒）视为断流，保持原有 600s 超时语义
 
 COMPLEX_KEYWORDS = [
     "设计", "重构", "架构", "优化", "调试", "排错", "分析", "为什么", "原理", "比较",
@@ -449,7 +454,7 @@ TOOL_IMPL = {
 # --------------------------------------------------------------------------
 # DeepSeek 流式调用
 # --------------------------------------------------------------------------
-def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_reason=None):
+def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_reason=None, should_stop=None):
     cc = _chat_cfg(cfg, cfg.get("model"))
     body = {
         "model": cc["model"],
@@ -516,10 +521,34 @@ def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_rea
 
     try:
         with resp:
+            # 读取阶段用短超时：服务器不发数据的间隙也能及时响应「停止」
+            try:
+                resp.fp.raw._sock.settimeout(STREAM_READ_TIMEOUT)
+            except Exception:
+                pass
             buf = ""
-            for raw in resp:
-                if not raw:
+            idle = 0.0
+            it = iter(resp)  # HTTPResponse 迭代器逐行返回，SSE 每行一条 data，保证流式及时
+            while True:
+                try:
+                    raw = next(it)
+                except StopIteration:
+                    break
+                except socket.timeout:
+                    # 服务器暂未发数据：趁机检查是否点了「停止」，保证思考阶段也能及时中断
+                    if should_stop and should_stop():
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        raise InterruptedError("用户已停止生成")
+                    idle += STREAM_READ_TIMEOUT
+                    if idle >= STREAM_IDLE_LIMIT:
+                        raise TimeoutError("流式读取超时（长时间无数据）")
                     continue
+                if not raw:
+                    break
+                idle = 0.0
                 buf += raw.decode("utf-8", errors="replace")
                 while "\n\n" in buf:
                     event, buf = buf.split("\n\n", 1)
@@ -530,6 +559,12 @@ def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_rea
                         payload = line[len("data:"):].strip()
                         if payload == "[DONE]":
                             continue
+                        if should_stop and should_stop():
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                            raise InterruptedError("用户已停止生成")
                         try:
                             chunk = json.loads(payload)
                         except Exception:
@@ -539,6 +574,8 @@ def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_rea
                         fr = fchoice.get("finish_reason")
                         if fr:
                             finish_reason = fr
+    except InterruptedError:
+        raise
     except (URLError, OSError, TimeoutError, ConnectionError) as e:
         # 进入流式后中途断流：保留已生成内容，标记 error 交由上层提示/续写，避免整段丢失
         log("streaming interrupted: " + str(getattr(e, "reason", e)))
@@ -557,13 +594,18 @@ def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_rea
             "type": tc.get("type", "function"),
             "function": {"name": tc.get("name"), "arguments": parsed},
         })
+    if finish_reason == "error":
+        # 断流时工具调用参数可能不完整（arguments 未闭合），丢弃只保留已生成文本，
+        # 交由上层自动续传，避免残缺 tool_calls 导致下一轮 API 400。
+        tool_calls = []
     return "".join(content), "".join(reasoning), tool_calls, finish_reason
 
 
-def compact_history(history):
+def compact_history(history, force=False):
     """上下文压缩：history 超过硬上限（条数或字符）时，把最旧的部分压缩为一条
     摘要 system 消息，保留最近 CTX_KEEP_RECENT 条完整。纯本地、不额外调模型，
     避免历史无限膨胀导致 API 请求超时/中断。返回 (新history, 是否压缩)。
+    force=True 时忽略阈值强制压缩（用于发送前体积兜底）。
 
     注意：切分点必须落在合法的 assistant↔tool 配对边界，否则保留窗口第一条是
     孤立 tool 消息（其 assistant(tool_calls) 已被裁掉）时，DeepSeek 会返回
@@ -573,7 +615,7 @@ def compact_history(history):
         return history, False
     n = len(history)
     size = sum(len(json.dumps(m, ensure_ascii=False)) for m in history)
-    if n <= CTX_HARD_LIMIT and size <= CTX_SOFT_LIMIT:
+    if not force and n <= CTX_HARD_LIMIT and size <= CTX_SOFT_LIMIT:
         return history, False
 
     # 保留最近 N 条，但窗口头部向前回退：跳过窗口开头的孤立 tool 消息，
@@ -583,6 +625,10 @@ def compact_history(history):
         start -= 1
     if start < 0:
         start = 0
+    if start == 0:
+        # 没有旧消息可压缩（条数本就在保留窗口内，如单条超大消息场景），
+        # 返回原样，交由上层做单条截断，避免凭空加一条空摘要反而变大。
+        return history, False
     old = history[:start]
     recent = history[start:]
 
@@ -608,6 +654,29 @@ def compact_history(history):
     return new, True
 
 
+def ensure_request_size(messages, hard=CTX_HARD_BYTES):
+    """发送前兜底：请求体序列化体积超过硬上限时强制压缩（保留首条 system prompt + 最近消息），
+    并截断单条超长消息，避免 API 请求体超限/超时导致长任务中断。
+    返回 (messages, 是否处理过)。"""
+    size = sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
+    if size <= hard:
+        return messages, False
+    head = []
+    rest = messages
+    if messages and messages[0].get("role") == "system":
+        head = [messages[0]]
+        rest = messages[1:]
+    new_rest, _ = compact_history(rest, force=True)
+    out = head + new_rest
+    truncated = False
+    for m in out:
+        c = m.get("content")
+        if isinstance(c, str) and len(c) > MAX_MSG_CHARS:
+            m["content"] = c[:MAX_MSG_CHARS] + "\n\n[内容过长，已自动截断]"
+            truncated = True
+    return out, True
+
+
 def sanitize_messages(messages):
     """防御性清洗：删除无法配对的孤立 tool 消息，并去掉末尾悬空的
     tool_calls（assistant 带 tool_calls 但缺 tool 响应）。长会话落盘裁剪
@@ -625,10 +694,15 @@ def sanitize_messages(messages):
             pending.discard(tid)
             out.append(m)
         else:
-            if role == "assistant" and m.get("tool_calls"):
-                for tc in m["tool_calls"]:
-                    if tc and tc.get("id"):
-                        pending.add(tc["id"])
+            if role == "assistant":
+                # 跳过 content 为空且没有 tool_calls 的 assistant 消息，
+                # 否则 DeepSeek 会返回 400: "content or tool_calls must be set"
+                if not m.get("content") and not m.get("tool_calls"):
+                    continue
+                if m.get("tool_calls"):
+                    for tc in m["tool_calls"]:
+                        if tc and tc.get("id"):
+                            pending.add(tc["id"])
             out.append(m)
     while out and out[-1].get("role") == "assistant" and out[-1].get("tool_calls"):
         out.pop()
@@ -781,7 +855,7 @@ def _build_vision_content(text, images):
     return parts
 
 
-def stream_vision(messages, cfg, max_tokens=VISION_MAX_TOKENS, on_text=None):
+def stream_vision(messages, cfg, max_tokens=VISION_MAX_TOKENS, on_text=None, should_stop=None):
     """调用千问 VL（OpenAI 兼容接口，流式，无工具）。返回完整回复文本。"""
     v = _vision_cfg(cfg)
     if not v["api_key"]:
@@ -807,10 +881,32 @@ def stream_vision(messages, cfg, max_tokens=VISION_MAX_TOKENS, on_text=None):
     reasoning = []
     tc_acc = {}
     with urlopen(req, timeout=600) as resp:
+        try:
+            resp.fp.raw._sock.settimeout(STREAM_READ_TIMEOUT)
+        except Exception:
+            pass
         buf = ""
-        for raw in resp:
-            if not raw:
+        idle = 0.0
+        it = iter(resp)
+        while True:
+            try:
+                raw = next(it)
+            except StopIteration:
+                break
+            except socket.timeout:
+                if should_stop and should_stop():
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    raise InterruptedError("用户已停止生成")
+                idle += STREAM_READ_TIMEOUT
+                if idle >= STREAM_IDLE_LIMIT:
+                    raise TimeoutError("流式读取超时（长时间无数据）")
                 continue
+            if not raw:
+                break
+            idle = 0.0
             buf += raw.decode("utf-8", errors="replace")
             while "\n\n" in buf:
                 event, buf = buf.split("\n\n", 1)
@@ -821,6 +917,12 @@ def stream_vision(messages, cfg, max_tokens=VISION_MAX_TOKENS, on_text=None):
                     payload = line[len("data:"):].strip()
                     if payload == "[DONE]":
                         continue
+                    if should_stop and should_stop():
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        raise InterruptedError("用户已停止生成")
                     try:
                         chunk = json.loads(payload)
                     except Exception:
@@ -858,6 +960,31 @@ def _safe_name(name):
     return name[:80] or "任务"
 
 
+def _atomic_write_json(path, data):
+    """崩溃安全的原子写：先写 .tmp（含 fsync 落盘），再 rename 替换目标文件。
+    避免强杀/断电导致会话文件写一半损坏。"""
+    path = Path(path)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=1))
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
+
+
+def _cleanup_orphan_tmp():
+    """启动时清理残留的 .tmp 文件（上次进程异常退出可能留下，不影响主文件）。"""
+    try:
+        if SESSIONS_DIR.exists():
+            for p in SESSIONS_DIR.glob("*.tmp"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------
 # 前端桥接
 # --------------------------------------------------------------------------
@@ -892,8 +1019,10 @@ class Api:
         self._asst_open = False
         self._asst_text = ""
         self._pending_confirm = None
+        self._last_ctx_save = 0.0      # 上次增量落盘时间（节流用，防频繁 IO）
 
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        _cleanup_orphan_tmp()
         self._restore_last()
         log("Api init; model=%s; has_key=%s" % (self.model, bool(self.cfg.get("api_key"))))
 
@@ -1022,6 +1151,22 @@ class Api:
             "name": name,
         }
 
+    def load_earlier(self, offset):
+        """分页加载更早的历史消息（每页 PLAYBACK_LIMIT 条）。
+        offset 为当前已展示条数；返回 {entries, remaining}，供 UI 顶部「加载更早」使用。"""
+        if not self.session_name:
+            return {"entries": [], "remaining": 0}
+        p = SESSIONS_DIR / f"{self.session_name}.json"
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"error": str(e)}
+        tr = data.get("transcript", [])
+        # 已展示 offset 条（时间正序末尾）；更早内容位于其之前
+        end = max(0, len(tr) - int(offset or 0))
+        start = max(0, end - PLAYBACK_LIMIT)
+        return {"entries": tr[start:end], "remaining": start}
+
     def _restore_last(self):
         """启动时自动恢复上次打开的任务（不推送前端，由 init 返回的 state 携带历史）。"""
         try:
@@ -1063,13 +1208,9 @@ class Api:
                 continue
             if cd.get("parent") == old:
                 cd["parent"] = new
-                tmp = cp.with_suffix(".tmp")
-                tmp.write_text(json.dumps(cd, ensure_ascii=False, indent=1), encoding="utf-8")
-                tmp.replace(cp)
+                _atomic_write_json(cp, cd)
         # 写回改名后的父任务
-        tmp = new_p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(new_p)
+        _atomic_write_json(new_p, data)
         # 若当前打开的就是被改名的任务，同步内存状态
         if self.session_name == old:
             self.session_name = new
@@ -1086,9 +1227,7 @@ class Api:
         except Exception as e:
             return {"error": str(e)}
         data["pinned"] = not bool(data.get("pinned"))
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(p)
+        _atomic_write_json(p, data)
         if self.session_name == name:
             self.pinned = data["pinned"]
         return {"ok": True, "pinned": data["pinned"]}
@@ -1112,9 +1251,7 @@ class Api:
             "artifacts": [],
         }
         p = SESSIONS_DIR / f"{child}.json"
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(p)
+        _atomic_write_json(p, data)
         return {"ok": True, "name": child, "parent": parent}
 
     def delete_task(self, name):
@@ -1178,10 +1315,8 @@ class Api:
             "artifacts": self.artifacts,
         }
         p = SESSIONS_DIR / f"{self.session_name}.json"
-        tmp = p.with_suffix(".tmp")
         try:
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-            tmp.replace(p)
+            _atomic_write_json(p, data)
         except Exception as e:
             log("保存会话失败：" + str(e))
 
@@ -1474,6 +1609,9 @@ class Api:
         self.call_js("appendAssistant", t)
 
     def _on_reason(self, r):
+        # 思考阶段也响应停止：DeepSeek 深度思考可能持续很久，不能让停止按钮失效
+        if self._stop:
+            raise InterruptedError("用户已停止生成")
         self._ensure_assistant()
         self.call_js("appendReason", r)
 
@@ -1539,12 +1677,19 @@ class Api:
         ctx["transcript"] = tr
 
         p = SESSIONS_DIR / f"{target}.json"
-        tmp = p.with_suffix(".tmp")
         try:
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-            tmp.replace(p)
+            _atomic_write_json(p, data)
         except Exception as e:
             log("保存会话失败：" + str(e))
+
+    def _save_ctx_throttled(self, ctx, interval=2.0):
+        """节流落盘：距上次写盘超过 interval 秒才写，避免频繁 IO 拖慢生成。
+        崩溃/强杀时最多丢失最近几秒的增量，任务与用户消息不会整轮消失。"""
+        now = time.time()
+        if now - getattr(self, "_last_ctx_save", 0.0) < interval:
+            return
+        self._last_ctx_save = now
+        self._save_ctx(ctx)
 
     def _approve(self, command):
         self._pending_confirm = {"event": threading.Event(), "result": False}
@@ -1555,6 +1700,9 @@ class Api:
         return res
 
     def _run_tool(self, tc):
+        # 工具执行前响应停止：防止模型连续调用多个耗时工具时无法中断
+        if self._stop:
+            raise InterruptedError("用户已停止生成")
         name = tc["function"]["name"]
         args = tc["function"]["arguments"]
         if isinstance(args, str):
@@ -1625,6 +1773,9 @@ class Api:
         self.call_js("appendUser", text, len(self._pending_images))
         if ctx is not None:
             ctx["transcript"].append({"role": "user", "text": text, "image": len(self._pending_images)})
+            # 用户消息立即落盘：即使生成中崩溃/强杀，本条消息与任务文件也不会整轮丢失
+            self._save_ctx(ctx)
+            self._last_ctx_save = time.time()
         try:
             if self._pending_images and self._pending_image_kind == "vision":
                 self._vision_loop(text)
@@ -1632,6 +1783,8 @@ class Api:
                 self._ocr_then_agent(text)
             else:
                 self._agent_loop(text)
+        except InterruptedError:
+            self.call_js("appendSystem", "已停止")
         finally:
             self._pending_images = []
             self._pending_image_kind = None
@@ -1713,7 +1866,11 @@ class Api:
         messages.append({"role": "user", "content": content})
         self._ensure_assistant()
         try:
-            reply = stream_vision(messages, self.cfg, VISION_MAX_TOKENS, on_text=self._on_text)
+            reply = stream_vision(messages, self.cfg, VISION_MAX_TOKENS, on_text=self._on_text,
+                                  should_stop=lambda: self._stop)
+        except InterruptedError:
+            # 用户点了停止：向上传递，由 _run_agent 统一显示「已停止」，不触发 OCR 兜底
+            raise
         except Exception as e:
             self.call_js("appendSystem", f"视觉模型调用失败：{e}")
             # 视觉失败自动降级到本地 OCR 兜底，尽量不丢失用户意图
@@ -1753,11 +1910,16 @@ class Api:
         attempt_continue = 0
         try:
             while True:
+                # 发送前体积兜底：历史膨胀/单条超大消息时强制压缩，防请求体超限中断
+                messages, shrunk = ensure_request_size(messages)
+                if shrunk:
+                    self.call_js("appendSystem", "上下文较大，已自动压缩以保持请求稳定")
                 content, reasoning, tool_calls, finish = stream_chat(
                     messages, self.cfg, TOOLS, thinking, MAX_TOKENS,
                     on_text=self._on_text,
+                    should_stop=lambda: self._stop,
                 )
-                assistant_msg = {"role": "assistant", "content": content or None}
+                assistant_msg = {"role": "assistant", "content": content or ""}
                 if tool_calls:
                     sig = json.dumps(
                         [(tc["function"]["name"], tc["function"]["arguments"]) for tc in tool_calls],
@@ -1798,22 +1960,35 @@ class Api:
                             "tool_call_id": tc["id"],
                             "content": result,
                         })
+                        # 每个工具执行完增量落盘：长任务中崩溃最多丢最后几秒
+                        self._save_ctx_throttled(ctx)
                 else:
-                    # 长任务输出被 max_tokens 截断（finish_reason=length）：自动续写，直至完整或达上限
-                    if finish == "length" and attempt_continue < MAX_CONTINUE:
+                    # 长任务输出被 max_tokens 截断（length）或流式中断（error）：自动续写，直至完整或达上限
+                    if finish in ("length", "error") and attempt_continue < MAX_CONTINUE:
                         attempt_continue += 1
                         messages.append(assistant_msg)
                         ctx["history"].append(assistant_msg)
                         if content:
                             ctx["transcript"].append({"role": "assistant", "text": content})
-                        self.call_js("appendSystem", f"输出较长，自动续写第 {attempt_continue} 段…")
-                        messages.append({"role": "user", "content": "（上文被输出上限截断，请继续，不要重复已写内容，从断点处直接接着写，保持格式连贯）"})
+                        if finish == "length":
+                            self.call_js("appendSystem", f"输出较长，自动续写第 {attempt_continue} 段…")
+                            messages.append({"role": "user", "content": "（上文被输出上限截断，请继续，不要重复已写内容，从断点处直接接着写，保持格式连贯）"})
+                        else:
+                            self.call_js("appendSystem", f"网络中断，自动续传第 {attempt_continue} 段…")
+                            messages.append({"role": "user", "content": "（上文因网络中断未写完，请继续，不要重复已写内容，从断点处直接接着写，保持格式连贯）"})
+                        # 续写前落盘已生成内容：中断/崩溃不丢已产出的文本
+                        self._save_ctx_throttled(ctx)
                         continue
+                    if finish == "error" and not content:
+                        raise RuntimeError("网络中断，未收到完整回复，请重试")
                     messages.append(assistant_msg)
                     ctx["history"].append(assistant_msg)
                     if content:
                         ctx["transcript"].append({"role": "assistant", "text": content})
-                    self.call_js("appendSystem", "完成")
+                    if finish == "error":
+                        self.call_js("appendSystem", "网络多次中断，已保留已生成内容")
+                    else:
+                        self.call_js("appendSystem", "完成")
                     break
         except InterruptedError:
             self.call_js("appendSystem", "已停止")
