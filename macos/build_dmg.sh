@@ -29,7 +29,7 @@ if [ ! -x "$VENV/bin/python3" ]; then
   /usr/bin/python3 -m venv "$VENV"
 fi
 "$VENV/bin/pip" install -q --upgrade pip
-"$VENV/bin/pip" install -q "pywebview[mac]>=6.0" pyinstaller
+"$VENV/bin/pip" install -q "pywebview[mac]>=6.0" pyinstaller pillow
 
 PY="$VENV/bin/python3"
 
@@ -60,5 +60,12 @@ if ! command -v npx >/dev/null 2>&1; then
   echo "需要 node/npx，请先安装 Node.js"
   exit 1
 fi
-npx --yes create-dmg "$OUT_DMG" "dist/${APP_NAME}.app" --overwrite
+npx --yes create-dmg "dist/${APP_NAME}.app" "dist" --overwrite --no-code-sign
+# create-dmg 会把 dmg 生成到目标目录下，文件名带版本号（如 MyCodex 0.0.0.dmg）
+# 统一重命名为 OUT_DMG，方便后续发布与引用
+GENERATED_DMG="$(ls -1 dist/${APP_NAME}*.dmg 2>/dev/null | head -1)"
+if [ -n "$GENERATED_DMG" ]; then
+  mv -f "$GENERATED_DMG" "$OUT_DMG"
+  echo "已重命名 -> $OUT_DMG"
+fi
 echo "完成: $OUT_DMG （双击若提示身份不明开发者，右键->打开 即可本地测试）"

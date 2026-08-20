@@ -115,6 +115,7 @@ PLAYBACK_LIMIT = 80         # 启动/打开任务时，界面最多回放的历�
 API_RETRY = 3               # 最大重试次数（指数退避 1/2/4s）
 API_RETRY_BASE_DELAY = 1.0
 STREAM_READ_TIMEOUT = 2.0   # 流式读取单次 socket 超时（秒）：期间可及时响应「停止」
+API_CONNECT_TIMEOUT = 30     # 连接建立阶段超时（秒）：provider 端网络挂死时避免 UI 冻结长达 600s
 STREAM_IDLE_LIMIT = 600.0   # 流式长时间无数据（秒）视为断流，保持原有 600s 超时语义
 
 COMPLEX_KEYWORDS = [
@@ -306,6 +307,36 @@ def _vision_cfg(cfg):
         "model": cfg.get("vision_model") or d["model"],
         "base_url": cfg.get("vision_base_url") or d["base_url"],
     }
+
+
+# 主模型（通义/Qwen）不可用时，自动切换到 DeepSeek 续跑同一轮对话
+_FALLBACK_MODEL = "deepseek-v4-flash"
+_FATAL_HINTS = ("arrearage", "overdue", "insufficient", "balance",
+                "401", "403", "authentication", "access denied",
+                "invalid api key", "unauthorized")
+
+
+def _is_fatal_provider_err(e):
+    """判断是否为「账户/鉴权类」致命错误（非瞬时，值得切备用 provider 而非重试）。"""
+    msg = str(e).lower()
+    return any(h in msg for h in _FATAL_HINTS)
+
+
+def _fallback_available(cfg):
+    """仅当主模型是 Qwen（通义）且配置了 DeepSeek key 时，DeepSeek 才作为备用。"""
+    return bool(cfg.get("api_key")) and (cfg.get("model") or "").lower().startswith("qwen")
+
+
+def _friendly_err(e):
+    """把底层错误转成用户可操作的提示。"""
+    s = str(e)
+    low = s.lower()
+    if "arrearage" in low or "overdue" in low or "insufficient" in low or "balance" in low:
+        return ("阿里云（通义）账户欠费或额度不足，对话已停止。"
+                "请结清欠费，或把模型切到「深度·Flash / 深度·Pro」(DeepSeek) 继续。")
+    if "401" in s or "403" in s or "authentication" in low or "access denied" in low or "invalid api key" in low:
+        return "API Key 鉴权失败，请检查 config.json 的 api_key / vision_api_key。"
+    return s
 
 
 def _chat_cfg(cfg, model=None):
@@ -535,8 +566,8 @@ def _run_tool_with_timeout(name, args, cwd, timeout=TOOL_EXEC_TIMEOUT):
 # --------------------------------------------------------------------------
 # DeepSeek 流式调用
 # --------------------------------------------------------------------------
-def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_reason=None, should_stop=None):
-    cc = _chat_cfg(cfg, cfg.get("model"))
+def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_reason=None, should_stop=None, model=None):
+    cc = _chat_cfg(cfg, model or cfg.get("model"))
     body = {
         "model": cc["model"],
         "messages": messages,
@@ -577,7 +608,7 @@ def stream_chat(messages, cfg, tools, thinking, max_tokens, on_text=None, on_rea
             method="POST",
         )
         try:
-            resp = urlopen(req, timeout=600)
+            resp = urlopen(req, timeout=API_CONNECT_TIMEOUT)
             break
         except HTTPError as e:
             err_body = ""
@@ -973,7 +1004,7 @@ def stream_vision(messages, cfg, max_tokens=VISION_MAX_TOKENS, on_text=None, sho
     content = []
     reasoning = []
     tc_acc = {}
-    with urlopen(req, timeout=600) as resp:
+    with urlopen(req, timeout=API_CONNECT_TIMEOUT) as resp:
         try:
             resp.fp.raw._sock.settimeout(STREAM_READ_TIMEOUT)
         except Exception:
@@ -1945,6 +1976,29 @@ class Api:
             merged = user_input
         self._agent_loop(merged)
 
+    def _call_chat(self, messages, thinking):
+        """包装 stream_chat：主模型（通义）遇账户/鉴权致命错误时，自动切 DeepSeek 续跑同一轮。"""
+        eff = _FALLBACK_MODEL if self._using_fallback else self.cfg.get("model")
+        try:
+            return stream_chat(
+                messages, self.cfg, TOOLS, thinking, MAX_TOKENS,
+                on_text=self._on_text,
+                should_stop=lambda: self._stop,
+                model=eff,
+            )
+        except RuntimeError as e:
+            if not self._using_fallback and _fallback_available(self.cfg) and _is_fatal_provider_err(e):
+                self._using_fallback = True
+                self.call_js("appendSystem",
+                             "主模型（通义）账户/鉴权不可用，已自动切换到深度·Flash 继续。")
+                return stream_chat(
+                    messages, self.cfg, TOOLS, thinking, MAX_TOKENS,
+                    on_text=self._on_text,
+                    should_stop=lambda: self._stop,
+                    model=_FALLBACK_MODEL,
+                )
+            raise
+
     def _vision_loop(self, user_input):
         """多模态单轮：把图片/PDF（支持多张）与历史文字上下文一起发给视觉模型。"""
         images = self._pending_images
@@ -1988,6 +2042,7 @@ class Api:
 
     def _agent_loop(self, user_input):
         self._stop = False
+        self._using_fallback = False
         ctx = self._ctx or {
             "task": self.session_name,
             "history": self.history,
@@ -2020,11 +2075,7 @@ class Api:
                 # 循环内防御：续写/工具轮次追加的消息也统一清洗，
                 # 杜绝空 assistant 或孤立 tool 消息进入请求体
                 messages = sanitize_messages(messages)
-                content, reasoning, tool_calls, finish = stream_chat(
-                    messages, self.cfg, TOOLS, thinking, MAX_TOKENS,
-                    on_text=self._on_text,
-                    should_stop=lambda: self._stop,
-                )
+                content, reasoning, tool_calls, finish = self._call_chat(messages, thinking)
                 assistant_msg = {"role": "assistant", "content": content or ""}
                 if tool_calls:
                     sig = json.dumps(
@@ -2105,7 +2156,7 @@ class Api:
             self.call_js("appendSystem", "已停止")
         except Exception as e:
             log_error(e, "agent_loop", ctx)
-            self.call_js("appendSystem", f"错误：{e}")
+            self.call_js("appendSystem", f"错误：{_friendly_err(e)}")
         finally:
             self._asst_open = False
 
